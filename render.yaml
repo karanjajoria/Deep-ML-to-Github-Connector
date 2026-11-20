@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: deepml-sync
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
+      - key: APP_KEY
+        sync: false
+      - key: GITHUB_BRANCH
+        value: main
