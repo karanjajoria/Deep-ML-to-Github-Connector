@@ -37,3 +37,4 @@ curl -X POST .../submit -H ... -d '{"title":"Sigmoid","manual":true,"solved":fal
 curl -X POST .../api/status -H ... -d '{"slug":"sigmoid","solved":true}'
  
 - [Matrix-Vector Dot Product](solutions/matrix_vector_dot_product.py) · easy · unsolved · [problem](https://www.deep-ml.com/problems/1)
+- [Single Neuron](solutions/single_neuron.py) · easy · solved · [problem](https://www.deep-ml.com/courses/neural-nets-to-gpt/learn?episode=ep1)
