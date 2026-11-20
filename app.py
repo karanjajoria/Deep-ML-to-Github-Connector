@@ -2,7 +2,8 @@
 
 Open the page, enter the problem title + your code, and it commits
 solutions/<slug>.py to your repo. Re-committing the same problem updates the
-same file (no copies) and the README index entry.
+same file (no copies) and the README index entry. Problems can be marked
+solved/unsolved, and "manual entries" log a problem without any code.
 """
 import base64
 import hashlib
@@ -52,12 +53,15 @@ BRANCH = _env("GITHUB_BRANCH", "main")
 
 if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO):
     raise RuntimeError("GITHUB_REPO must look like 'owner/repo'")
+if not re.fullmatch(r"[A-Za-z0-9._/-]+", BRANCH):
+    raise RuntimeError("GITHUB_BRANCH contains unsupported characters")
 if len(APP_KEY) < 16:
     raise RuntimeError("APP_KEY must be at least 16 characters (use a long random string)")
 
 APP_KEY_HASH = hashlib.sha256(APP_KEY.encode()).digest()
 
 GITHUB_URL = _https_url("GITHUB_URL", "https://github.com/karanjajoria")
+REPO_URL = _https_url("REPO_URL", f"https://github.com/{REPO}")
 LINKEDIN_URL = _https_url("LINKEDIN_URL", "https://www.linkedin.com/")
 CREDLY_URL = _https_url("CREDLY_URL", "https://www.credly.com/")
 
@@ -129,6 +133,7 @@ def put_file(path, content, message, sha=None):
 
 
 def list_solutions():
+    """Slugs of every solutions/*.py file."""
     r = _gh("GET", "solutions", params={"ref": BRANCH})
     if r.status_code == 404:
         return []
@@ -138,9 +143,8 @@ def list_solutions():
     for item in r.json():
         m = re.fullmatch(r"([a-z0-9_]{1,100})\.py", item.get("name", ""))
         if m and item.get("type") == "file":
-            slug = m.group(1)
-            out.append({"slug": slug, "title": slug.replace("_", " ").title()})
-    return sorted(out, key=lambda p: p["slug"])
+            out.append(m.group(1))
+    return sorted(out)
 
 
 # --------------------------------------------------------------------------
@@ -166,9 +170,13 @@ def clean_title(value):
     return title
 
 
-def clean_code(value):
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("Solution code is required.")
+def clean_code(value, required=True):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if required:
+            raise ValueError("Solution code is required (or switch on Manual entry).")
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("Solution code must be text.")
     code = value.replace("\r\n", "\n").replace("\r", "\n")
     if "\x00" in code:
         raise ValueError("Code contains invalid characters.")
@@ -203,39 +211,115 @@ def clean_note(value):
     return note
 
 
+def clean_bool(value, default):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError("Options must be true or false.")
+
+
 # --------------------------------------------------------------------------
-# Core sync logic
+# File format + README index
 # --------------------------------------------------------------------------
+# solutions/<slug>.py starts with a small header:
+#   """Title (difficulty)
+#   https://www.deep-ml.com/...        (optional)
+#   status: solved | unsolved
+#   entry: manual                      (only for entries without code)
+#   """
 HEADER_RE = re.compile(r'\A"""(.*?)\n"""\n\n', re.S)
+MANUAL_PLACEHOLDER = "# Manual entry: solution code has not been added yet."
 
 
-def build_content(title, code, difficulty, url):
+def build_content(title, code, difficulty, url, solved, manual):
     head = title + (f" ({difficulty})" if difficulty else "")
     if url:
         head += "\n" + url
-    return f'"""{head}\n"""\n\n{code.rstrip()}\n'
+    head += f"\nstatus: {'solved' if solved else 'unsolved'}"
+    if manual:
+        head += "\nentry: manual"
+    body = MANUAL_PLACEHOLDER if manual else code.rstrip()
+    return f'"""{head}\n"""\n\n{body}\n'
 
 
 def parse_content(text):
     m = HEADER_RE.match(text)
     if not m:
-        return {"title": "", "code": text, "difficulty": "", "url": ""}
+        return {"title": "", "code": text, "difficulty": "", "url": "", "solved": True, "manual": False}
     lines = m.group(1).split("\n")
     d = re.search(r"\((easy|medium|hard)\)$", lines[0])
+    url, solved, manual = "", True, False
+    for line in lines[1:]:
+        line = line.strip()
+        if line.startswith("https://"):
+            url = line
+        elif line.startswith("status:"):
+            solved = line.split(":", 1)[1].strip() != "unsolved"
+        elif line == "entry: manual":
+            manual = True
     return {
         "title": re.sub(r"\s*\((easy|medium|hard)\)$", "", lines[0]),
-        "code": text[m.end():],
+        "code": "" if manual else text[m.end():],
         "difficulty": d.group(1) if d else "",
-        "url": lines[1] if len(lines) > 1 else "",
+        "url": url,
+        "solved": solved,
+        "manual": manual,
     }
 
 
-def update_readme(title, slug, difficulty, url):
-    entry = f"- [{title}](solutions/{slug}.py)"
+def problem_record(slug, title, difficulty, solved, manual, url):
+    return {
+        "slug": slug,
+        "title": title,
+        "difficulty": difficulty,
+        "solved": solved,
+        "manual": manual,
+        "url": url,
+        "file_url": f"https://github.com/{REPO}/blob/{BRANCH}/solutions/{slug}.py",
+    }
+
+
+def readme_entry(title, slug, difficulty, solved, manual, url):
+    parts = [f"- [{title}](solutions/{slug}.py)"]
     if difficulty:
-        entry += f" · {difficulty}"
+        parts.append(difficulty)
+    parts.append("solved" if solved else "unsolved")
+    if manual:
+        parts.append("manual")
     if url:
-        entry += f" · [problem]({url})"
+        parts.append(f"[problem]({url})")
+    return " · ".join(parts)
+
+
+ENTRY_RE = re.compile(r"^- \[(.+?)\]\(solutions/([a-z0-9_]+)\.py\)(.*)$")
+
+
+def parse_readme(text):
+    items = []
+    for line in text.split("\n"):
+        m = ENTRY_RE.match(line)
+        if not m:
+            continue
+        title, slug, rest = m.groups()
+        item = problem_record(slug, title, "", True, False, "")
+        for part in (p.strip() for p in rest.split(" · ")):
+            if part in ("easy", "medium", "hard"):
+                item["difficulty"] = part
+            elif part == "unsolved":
+                item["solved"] = False
+            elif part == "manual":
+                item["manual"] = True
+            else:
+                u = re.match(r"\[problem\]\((https://[^)\s]+)\)$", part)
+                if u:
+                    item["url"] = u.group(1)
+        items.append(item)
+    return items
+
+
+def update_readme(title, slug, difficulty, url, solved, manual):
+    entry = readme_entry(title, slug, difficulty, solved, manual, url)
     marker = f"](solutions/{slug}.py)"
     for attempt in range(2):
         text, sha = get_file("README.md")
@@ -260,39 +344,103 @@ def update_readme(title, slug, difficulty, url):
     return False
 
 
-def sync(title, code, difficulty, url, note):
+def list_problems():
+    slugs = list_solutions()
+    on_disk = set(slugs)
+    text, _ = get_file("README.md")
+    out, seen = [], set()
+    for item in reversed(parse_readme(text or "")):  # newest first
+        if item["slug"] in on_disk and item["slug"] not in seen:
+            out.append(item)
+            seen.add(item["slug"])
+    for slug in slugs:  # files that aren't in the README index yet
+        if slug not in seen:
+            out.append(problem_record(slug, slug.replace("_", " ").title(), "", True, False, ""))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Core sync logic
+# --------------------------------------------------------------------------
+def _retry_conflict(exc, attempt):
+    return exc.status in (409, 422) and attempt == 0
+
+
+def sync(title, code, difficulty, url, note, solved):
     slug = slugify(title)  # same title -> same file, so re-commits never create copies
     path = f"solutions/{slug}.py"
+    commit_url, status = "", "unchanged"
+    use_title, use_url, is_manual = title, url, False
 
-    commit_url = ""
-    status = "unchanged"
     for attempt in range(2):
         old, sha = get_file(path)
-        if old:
-            title = parse_content(old)["title"] or title  # keep the original display title
-        content = build_content(title, code, difficulty, url)
+        prev = parse_content(old) if old else None
+        use_title = prev["title"] if prev and prev["title"] else title  # keep the original title
+        use_url = url or (prev["url"] if prev else "")
+        if code.strip():
+            body, is_manual = code, False
+        elif prev and not prev["manual"] and prev["code"].strip():
+            body, is_manual = prev["code"], False  # manual update keeps the saved code
+        else:
+            body, is_manual = "", True
+        content = build_content(use_title, body, difficulty, use_url, solved, is_manual)
         if old == content:
             status = "unchanged"
             break
-        verb = "Update" if sha else "Solve"
-        message = f"{verb}: {title}" + (f" - {note}" if note else "")
+        verb = "Update" if sha else ("Add" if is_manual else "Solve")
+        message = f"{verb}: {use_title}" + (f" - {note}" if note else "")
         try:
             commit_url = put_file(path, content, message, sha)
             status = "updated" if sha else "created"
             break
         except GitHubError as exc:
-            if exc.status in (409, 422) and attempt == 0:
-                continue  # file changed under us; re-read sha and retry once
+            if _retry_conflict(exc, attempt):
+                continue
             raise
 
     warnings = []
-    if status != "unchanged":
-        try:
-            update_readme(title, slug, difficulty, url)
-        except GitHubError:
-            warnings.append("Solution saved, but the README index could not be updated.")
+    try:
+        update_readme(use_title, slug, difficulty, use_url, solved, is_manual)
+    except GitHubError:
+        warnings.append("Saved, but the README index could not be updated.")
     log.info("sync %s -> %s", path, status)
-    return {"status": status, "path": path, "commit_url": commit_url, "warnings": warnings}
+    return {
+        "status": status,
+        "path": path,
+        "commit_url": commit_url,
+        "warnings": warnings,
+        "problem": problem_record(slug, use_title, difficulty, solved, is_manual, use_url),
+    }
+
+
+def set_status(slug, solved):
+    path = f"solutions/{slug}.py"
+    commit_url, status, rec = "", "unchanged", None
+    for attempt in range(2):
+        old, sha = get_file(path)
+        if old is None:
+            raise LookupError(slug)
+        prev = parse_content(old)
+        title = prev["title"] or slug.replace("_", " ").title()
+        rec = problem_record(slug, title, prev["difficulty"], solved, prev["manual"], prev["url"])
+        if prev["solved"] == solved and prev["title"]:
+            break
+        content = build_content(title, prev["code"], prev["difficulty"], prev["url"], solved, prev["manual"])
+        try:
+            commit_url = put_file(path, content, f"Mark {'solved' if solved else 'unsolved'}: {title}", sha)
+            status = "updated"
+            break
+        except GitHubError as exc:
+            if _retry_conflict(exc, attempt):
+                continue
+            raise
+    warnings = []
+    try:
+        update_readme(rec["title"], slug, rec["difficulty"], rec["url"], solved, rec["manual"])
+    except GitHubError:
+        warnings.append("Saved, but the README index could not be updated.")
+    log.info("status %s -> %s", path, "solved" if solved else "unsolved")
+    return {"status": status, "path": path, "commit_url": commit_url, "warnings": warnings, "problem": rec}
 
 
 # --------------------------------------------------------------------------
@@ -421,6 +569,7 @@ def home():
         nonce=g.nonce,
         year=date.today().year,
         github_url=GITHUB_URL,
+        repo_url=REPO_URL,
         linkedin_url=LINKEDIN_URL,
         credly_url=CREDLY_URL,
         max_code=MAX_CODE_CHARS,
@@ -434,15 +583,37 @@ def submit():
     if not isinstance(data, dict):
         return err("Send a JSON body with Content-Type: application/json.", 400)
     try:
+        manual = clean_bool(data.get("manual"), False)
+        solved = clean_bool(data.get("solved"), True)
         title = clean_title(data.get("title"))
-        code = clean_code(data.get("code"))
+        code = clean_code(data.get("code"), required=not manual)
         difficulty = clean_difficulty(data.get("difficulty"))
         url = clean_url(data.get("url"))
         note = clean_note(data.get("note"))
     except ValueError as exc:
         return err(str(exc), 400)
     try:
-        result = sync(title, code, difficulty, url, note)
+        result = sync(title, code, difficulty, url, note, solved)
+    except GitHubError as exc:
+        return github_failure(exc)
+    return jsonify(ok=True, **result)
+
+
+@app.post("/api/status")
+@protected
+def status_route():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return err("Send a JSON body with Content-Type: application/json.", 400)
+    slug, solved = data.get("slug"), data.get("solved")
+    if not isinstance(slug, str) or not SLUG_RE.match(slug):
+        return err("Invalid problem name.", 400)
+    if not isinstance(solved, bool):
+        return err("'solved' must be true or false.", 400)
+    try:
+        result = set_status(slug, solved)
+    except LookupError:
+        return err("No saved solution for that problem yet.", 404)
     except GitHubError as exc:
         return github_failure(exc)
     return jsonify(ok=True, **result)
@@ -452,7 +623,7 @@ def submit():
 @protected
 def problems():
     try:
-        return jsonify(ok=True, problems=list_solutions())
+        return jsonify(ok=True, problems=list_problems())
     except GitHubError as exc:
         return github_failure(exc)
 
@@ -503,15 +674,21 @@ body{background:var(--bg);color:var(--fg);min-height:100vh;display:flex;flex-dir
 font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .topbar{background:var(--subtle);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;gap:12px}
-.topbar svg{width:32px;height:32px;fill:var(--fg)}
-.topbar .name{font-size:16px;color:var(--muted)}.topbar .name b{color:var(--fg);font-weight:600}
+.logo{display:flex;border-radius:50%}
+.logo:focus-visible,.crumb:focus-visible{outline:2px solid var(--blue);outline-offset:3px}
+.logo svg{width:32px;height:32px;fill:var(--fg)}
+.logo:hover svg{fill:var(--accent)}
+.crumb{font-size:16px;color:var(--muted)}.crumb b{color:var(--fg);font-weight:600}
+.crumb:hover{text-decoration:none;color:var(--accent)}.crumb:hover b{color:var(--accent)}
 main{flex:1;width:100%;max-width:800px;margin:0 auto;padding:32px 16px}
 h1{font-size:24px;font-weight:600;margin:0 0 4px;padding-bottom:8px}
 .lead{color:var(--muted);margin:0 0 24px}
 .box{border:1px solid var(--border);border-radius:6px;background:var(--bg)}
+.box + .box{margin-top:24px}
 .box-header{background:var(--subtle);border-bottom:1px solid var(--border);padding:12px 16px;font-weight:600;
-display:flex;align-items:center;gap:8px;border-radius:6px 6px 0 0}
+display:flex;align-items:center;gap:8px;border-radius:6px 6px 0 0;flex-wrap:wrap}
 .box-header svg{width:16px;height:16px;fill:var(--muted)}
+.box-header .grow{flex:1}
 .box-body{padding:16px}
 .box-footer{border-top:1px solid var(--border);background:var(--subtle);padding:12px 16px;display:flex;
 gap:8px;justify-content:flex-end;flex-wrap:wrap;border-radius:0 0 6px 6px}
@@ -534,6 +711,7 @@ font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:12px;
 .btn{appearance:none;border:1px solid var(--border);background:var(--btn);color:var(--fg);border-radius:6px;
 padding:5px 16px;font:inherit;font-weight:500;line-height:20px;cursor:pointer;display:inline-flex;align-items:center;gap:8px}
 .btn:hover{background:var(--btn-h)}
+.btn.sm{padding:2px 10px;font-size:12px;font-weight:500}
 .btn.primary{background:var(--green);border-color:rgba(240,246,252,.1);color:#fff}
 .btn.primary:hover{background:var(--green-h)}
 .btn:disabled{opacity:.6;cursor:not-allowed}
@@ -546,6 +724,44 @@ border-radius:6px;padding:10px 12px;margin-top:8px;font-size:13px}
 .flash svg{width:16px;height:16px;flex:none;margin-top:2px;fill:none;stroke:var(--accent);stroke-width:1.6}
 code{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--subtle);border:1px solid var(--border);
 border-radius:4px;padding:1px 5px}
+/* toggle switch */
+.toggles{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:600px){.toggles{grid-template-columns:1fr}}
+.toggle{display:flex;justify-content:space-between;align-items:center;gap:12px;border:1px solid var(--border);
+border-radius:6px;padding:10px 12px;background:var(--subtle)}
+.toggle b{display:block}.toggle .d{color:var(--muted);font-size:12px}
+.switch{position:relative;display:inline-block;width:40px;height:24px;flex:none;margin:0}
+.switch input{position:absolute;inset:0;width:100%;height:100%;opacity:0;margin:0;cursor:pointer;z-index:1;min-height:0}
+.switch .track{position:absolute;inset:0;border-radius:12px;background:var(--btn-h);border:1px solid var(--border);transition:.15s}
+.switch .track::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;
+background:var(--muted);transition:.15s}
+.switch input:checked + .track{background:var(--green);border-color:var(--green)}
+.switch input:checked + .track::after{left:19px;background:#fff}
+.switch input:focus-visible + .track{outline:2px solid var(--blue);outline-offset:2px}
+.switch input:disabled{cursor:wait}.switch input:disabled + .track{opacity:.5}
+/* problems list */
+.count{background:var(--btn-h);border-radius:2em;padding:0 8px;font-size:12px;line-height:18px;font-weight:500}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.seg button{background:var(--btn);border:0;border-right:1px solid var(--border);padding:2px 12px;font:inherit;
+font-size:12px;font-weight:500;color:var(--fg);cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button[aria-pressed="true"]{background:var(--blue);color:#fff}
+.plist{list-style:none;margin:0;padding:0}
+.prow{display:flex;align-items:center;gap:12px;padding:10px 16px;border-top:1px solid var(--border)}
+.prow:first-child{border-top:0}
+.dot{flex:none;display:flex}.dot svg{width:16px;height:16px}
+.dot.solved{color:var(--green-h)}.dot.unsolved{color:var(--muted)}
+.pmain{flex:1;min-width:0}
+.ptitle{background:none;border:0;color:var(--fg);font:inherit;font-weight:600;padding:0;cursor:pointer;text-align:left;word-break:break-word}
+.ptitle:hover{color:var(--accent);text-decoration:underline}
+.pmeta{display:flex;gap:6px;margin-top:2px;flex-wrap:wrap}
+.chip{border:1px solid var(--border);border-radius:2em;padding:0 8px;font-size:12px;line-height:18px;color:var(--muted)}
+.chip.easy{color:var(--green-h);border-color:var(--green-h)}
+.chip.medium{color:var(--amber);border-color:var(--amber)}
+.chip.hard{color:var(--red);border-color:var(--red)}
+.pgh{color:var(--muted);display:flex}.pgh:hover{color:var(--accent)}.pgh svg{width:16px;height:16px}
+.slabel{font-size:12px;color:var(--muted);width:56px;text-align:right}
+.empty{padding:24px 16px;text-align:center;color:var(--muted)}
 /* toasts */
 #toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:50;width:min(380px,calc(100vw - 32px))}
 .toast{display:flex;gap:10px;align-items:flex-start;background:var(--subtle);border:1px solid var(--border);
@@ -579,8 +795,10 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
 </head>
 <body>
 <header class="topbar">
-  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>
-  <span class="name">Deep-ML <span>/</span> <b>Sync</b></span>
+  <a class="logo" href="{{ github_url }}" target="_blank" rel="noopener noreferrer" aria-label="GitHub profile (home)" title="GitHub profile">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>
+  </a>
+  <a class="crumb" href="{{ repo_url }}" target="_blank" rel="noopener noreferrer" title="Open the solutions repository">Deep-ML <span>/</span> <b>Sync</b></a>
 </header>
 
 <main>
@@ -620,11 +838,22 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
         </div>
       </div>
 
+      <div class="toggles field">
+        <div class="toggle">
+          <div><b>Solved</b><span class="d">Turn off if you haven't solved it yet.</span></div>
+          <label class="switch"><input id="solved" type="checkbox" role="switch" checked aria-label="Solved"><span class="track"></span></label>
+        </div>
+        <div class="toggle">
+          <div><b>Manual entry</b><span class="d">Log the problem without code.</span></div>
+          <label class="switch"><input id="manual" type="checkbox" role="switch" aria-label="Manual entry"><span class="track"></span></label>
+        </div>
+      </div>
+
       <div class="field">
-        <label for="code">Solution</label>
+        <label for="code">Solution <span id="code-opt" class="opt" hidden>(optional for manual entries)</span></label>
         <div class="editor">
           <div class="editor-head"><span>solution.py</span><span id="count">0 / {{ max_code }}</span></div>
-          <textarea id="code" spellcheck="false" placeholder="Paste your solution here" required></textarea>
+          <textarea id="code" spellcheck="false" placeholder="Paste your solution here"></textarea>
         </div>
       </div>
 
@@ -638,6 +867,21 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       <button type="submit" id="go" class="btn primary">Commit changes</button>
     </div>
   </form>
+
+  <section class="box" aria-labelledby="ptitle-h">
+    <div class="box-header">
+      <span id="ptitle-h">Your problems</span> <span class="count" id="pcount">0</span>
+      <span class="grow"></span>
+      <div class="seg" id="seg" role="group" aria-label="Filter problems">
+        <button type="button" data-f="all" aria-pressed="true">All</button>
+        <button type="button" data-f="solved" aria-pressed="false">Solved</button>
+        <button type="button" data-f="unsolved" aria-pressed="false">Unsolved</button>
+      </div>
+      <button type="button" id="refresh" class="btn sm">Refresh</button>
+    </div>
+    <ul class="plist" id="plist"></ul>
+    <div class="empty" id="empty">Enter your app key above to load your problems.</div>
+  </section>
 </main>
 
 <footer>
@@ -681,7 +925,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   "use strict";
   const $ = (id) => document.getElementById(id);
   const MAX_CODE = {{ max_code }};
-  let known = new Set(), lastKey = "", busy = false, hintTimer;
+  let problems = [], known = new Set(), lastKey = "", busy = false, unlocked = false, filter = "all", hintTimer;
 
   const svg = (inner) => '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + "</svg>";
   const ICONS = {
@@ -690,6 +934,9 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     info: svg('<circle cx="8" cy="8" r="6.5"/><path d="M8 7.2v4M8 4.8v.01"/>'),
     warning: svg('<path d="M8 2L14.5 13.5H1.5Z"/><path d="M8 6.5v3.2M8 11.6v.01"/>')
   };
+  const DOT_SOLVED = '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="7"/><path d="M4.8 8.2l2.2 2.2 4.2-4.4" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const DOT_OPEN = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/></svg>';
+  const EXT = svg('<path d="M9 2h5v5M14 2L7.5 8.5M12 9.5V13a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3.5"/>');
 
   function toast(kind, title, message, link) {
     const el = document.createElement("div");
@@ -719,11 +966,11 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     if (options.body) headers["Content-Type"] = "application/json";
     let res;
     try {
-      res = await fetch(path, Object.assign({}, options, { headers, cache: "no-store", credentials: "omit" }));
+      res = await fetch(path, Object.assign({}, options, { headers: headers, cache: "no-store", credentials: "omit" }));
     } catch (e) { return { networkError: true }; }
     let data = {};
     try { data = await res.json(); } catch (e) {}
-    return { res, data };
+    return { res: res, data: data };
   }
 
   function failToast(r) {
@@ -738,6 +985,70 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
 
   const slugify = (t) => t.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 
+  /* ---------- problems list ---------- */
+  function makeSwitch(checked, label) {
+    const l = document.createElement("label"); l.className = "switch";
+    const i = document.createElement("input");
+    i.type = "checkbox"; i.setAttribute("role", "switch"); i.checked = checked; i.setAttribute("aria-label", label);
+    const t = document.createElement("span"); t.className = "track";
+    l.append(i, t);
+    return { el: l, input: i };
+  }
+
+  function row(p) {
+    const li = document.createElement("li"); li.className = "prow";
+    const dot = document.createElement("span");
+    dot.className = "dot " + (p.solved ? "solved" : "unsolved");
+    dot.innerHTML = p.solved ? DOT_SOLVED : DOT_OPEN;
+
+    const main = document.createElement("div"); main.className = "pmain";
+    const t = document.createElement("button");
+    t.type = "button"; t.className = "ptitle"; t.textContent = p.title; t.title = "Load into the form";
+    t.addEventListener("click", async () => {
+      await loadInto(p.slug, p.title);
+      $("f").scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    const meta = document.createElement("div"); meta.className = "pmeta";
+    if (p.difficulty) { const c = document.createElement("span"); c.className = "chip " + p.difficulty; c.textContent = p.difficulty; meta.appendChild(c); }
+    if (p.manual) { const c = document.createElement("span"); c.className = "chip"; c.textContent = "manual"; meta.appendChild(c); }
+    main.append(t, meta);
+
+    li.append(dot, main);
+    if (p.file_url && p.file_url.startsWith("https://github.com/")) {
+      const a = document.createElement("a");
+      a.className = "pgh"; a.href = p.file_url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      a.title = "Open on GitHub"; a.setAttribute("aria-label", "Open " + p.title + " on GitHub"); a.innerHTML = EXT;
+      li.appendChild(a);
+    }
+    const label = document.createElement("span"); label.className = "slabel"; label.textContent = p.solved ? "Solved" : "Unsolved";
+    const sw = makeSwitch(p.solved, "Solved: " + p.title);
+    sw.input.addEventListener("change", async () => {
+      const want = sw.input.checked;
+      sw.input.disabled = true;
+      const r = await api("/api/status", { method: "POST", body: JSON.stringify({ slug: p.slug, solved: want }) });
+      sw.input.disabled = false;
+      if (r.networkError || !r.res.ok) { sw.input.checked = !want; return failToast(r); }
+      upsert(r.data.problem);
+      toast("success", want ? "Marked as solved" : "Marked as unsolved", p.title, r.data.commit_url);
+      (r.data.warnings || []).forEach((w) => toast("warning", "Heads up", w));
+    });
+    li.append(label, sw.el);
+    return li;
+  }
+
+  function renderList() {
+    const list = $("plist"); list.replaceChildren();
+    $("pcount").textContent = problems.length;
+    document.querySelectorAll("#seg button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.f === filter)));
+    const shown = problems.filter((p) => filter === "all" || (filter === "solved") === p.solved);
+    shown.forEach((p) => list.appendChild(row(p)));
+    $("empty").hidden = shown.length > 0;
+    if (!shown.length) {
+      $("empty").textContent = !unlocked ? "Enter your app key above to load your problems."
+        : problems.length ? "No problems match this filter." : "No problems yet. Commit your first solution above.";
+    }
+  }
+
   function updateHint() {
     const slug = slugify($("title").value);
     const hit = slug && known.has(slug);
@@ -745,17 +1056,32 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     if (hit) $("hint-text").textContent = "A solution for this problem already exists. Committing will update solutions/" + slug + ".py; no copy will be created.";
   }
 
-  async function loadProblems() {
-    const key = $("key").value;
-    if (!key || key === lastKey) return;
-    lastKey = key;
-    const r = await api("/api/problems");
-    if (r.networkError || !r.res.ok) { lastKey = ""; return failToast(r); }
-    known = new Set(r.data.problems.map((p) => p.slug));
+  function render() {
+    known = new Set(problems.map((p) => p.slug));
     const dl = $("problems"); dl.replaceChildren();
-    r.data.problems.forEach((p) => { const o = document.createElement("option"); o.value = p.title; dl.appendChild(o); });
-    toast("info", "Unlocked", r.data.problems.length + " saved solution" + (r.data.problems.length === 1 ? "" : "s") + " found.");
-    updateHint();
+    problems.forEach((p) => { const o = document.createElement("option"); o.value = p.title; dl.appendChild(o); });
+    renderList(); updateHint();
+  }
+
+  function upsert(p) {
+    const i = problems.findIndex((x) => x.slug === p.slug);
+    if (i >= 0) problems[i] = p; else problems.unshift(p);
+    render();
+  }
+
+  async function refreshList(announce) {
+    const r = await api("/api/problems");
+    if (r.networkError || !r.res.ok) { lastKey = ""; unlocked = false; problems = []; render(); return failToast(r); }
+    unlocked = true; problems = r.data.problems; render();
+    if (announce) toast("info", "Unlocked", problems.length + " problem" + (problems.length === 1 ? "" : "s") + " found.");
+  }
+
+  /* ---------- form ---------- */
+  function applyManual() {
+    const m = $("manual").checked;
+    $("code-opt").hidden = !m;
+    $("code").placeholder = m ? "Optional: paste your solution, or leave empty to just log the problem" : "Paste your solution here";
+    if (!busy) $("go").textContent = m ? "Add manual entry" : "Commit changes";
   }
 
   function setBusy(on) {
@@ -764,45 +1090,65 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     go.disabled = on;
     go.replaceChildren();
     if (on) { const s = document.createElement("span"); s.className = "spin"; go.append(s, "Committing\u2026"); }
-    else go.textContent = "Commit changes";
+    else applyManual();
   }
 
-  $("key").addEventListener("change", loadProblems);
-  $("title").addEventListener("input", () => { clearTimeout(hintTimer); hintTimer = setTimeout(updateHint, 150); });
-  $("code").addEventListener("input", () => { $("count").textContent = $("code").value.length + " / " + MAX_CODE; });
-
-  $("load").addEventListener("click", async () => {
-    const slug = slugify($("title").value);
+  async function loadInto(slug, title) {
     const r = await api("/api/solution?slug=" + encodeURIComponent(slug));
     if (r.networkError || !r.res.ok) return failToast(r);
-    $("code").value = r.data.code;
-    if (r.data.difficulty) $("difficulty").value = r.data.difficulty;
-    $("url").value = r.data.url || "";
+    const d = r.data;
+    if (title) $("title").value = title;
+    $("code").value = d.code || "";
+    if (d.difficulty) $("difficulty").value = d.difficulty;
+    $("url").value = d.url || "";
+    $("solved").checked = d.solved;
+    $("manual").checked = d.manual;
     $("code").dispatchEvent(new Event("input"));
-    toast("info", "Loaded", "Current code for this problem is in the editor.");
+    applyManual(); updateHint();
+    toast("info", "Loaded", d.manual ? "Manual entry loaded. Add your code whenever you're ready." : "Current code is in the editor.");
+  }
+
+  $("key").addEventListener("change", () => {
+    const k = $("key").value;
+    if (!k) { lastKey = ""; unlocked = false; problems = []; render(); return; }
+    if (k === lastKey) return;
+    lastKey = k;
+    refreshList(true);
   });
+  $("title").addEventListener("input", () => { clearTimeout(hintTimer); hintTimer = setTimeout(updateHint, 150); });
+  $("code").addEventListener("input", () => { $("count").textContent = $("code").value.length + " / " + MAX_CODE; });
+  $("manual").addEventListener("change", applyManual);
+  $("load").addEventListener("click", () => loadInto(slugify($("title").value)));
+  $("refresh").addEventListener("click", async () => {
+    if (!$("key").value) return toast("warning", "App key needed", "Enter your app key first.");
+    await refreshList(false);
+    if (unlocked) toast("info", "Refreshed", problems.length + " problem" + (problems.length === 1 ? "" : "s") + " loaded.");
+  });
+  document.querySelectorAll("#seg button").forEach((b) => b.addEventListener("click", () => { filter = b.dataset.f; renderList(); }));
 
   $("f").addEventListener("submit", async (e) => {
     e.preventDefault();
     if (busy) return;
+    const manual = $("manual").checked;
     if (!$("key").value) { toast("warning", "App key needed", "Enter your app key first."); return $("key").focus(); }
     if (!$("title").value.trim()) { toast("warning", "Title needed", "Enter the problem title."); return $("title").focus(); }
-    if (!$("code").value.trim()) { toast("warning", "Nothing to commit", "Paste your solution first."); return $("code").focus(); }
+    if (!manual && !$("code").value.trim()) { toast("warning", "Nothing to commit", "Paste your solution, or switch on Manual entry."); return $("code").focus(); }
     if ($("code").value.length > MAX_CODE) return toast("error", "Code too long", "Maximum is " + MAX_CODE + " characters.");
 
     setBusy(true);
     try {
       const r = await api("/submit", { method: "POST", body: JSON.stringify({
         title: $("title").value, code: $("code").value, difficulty: $("difficulty").value,
-        url: $("url").value, note: $("note").value
+        url: $("url").value, note: $("note").value, solved: $("solved").checked, manual: manual
       })});
       if (r.networkError || !r.res.ok) return failToast(r);
-      const d = r.data;
-      if (d.status === "created") toast("success", "Solution committed", "Created " + d.path, d.commit_url);
-      else if (d.status === "updated") toast("success", "Solution updated", "Updated " + d.path + " (same file, new version).", d.commit_url);
-      else toast("info", "No changes", "This code is already committed for this problem.");
+      const d = r.data, entry = d.problem && d.problem.manual;
+      const tag = d.problem ? (d.problem.solved ? " (solved)" : " (unsolved)") : "";
+      if (d.status === "created") toast("success", entry ? "Manual entry added" : "Solution committed", "Created " + d.path + tag, d.commit_url);
+      else if (d.status === "updated") toast("success", entry ? "Entry updated" : "Solution updated", "Updated " + d.path + tag + ". Same file, new version.", d.commit_url);
+      else toast("info", "No changes", "This is already committed exactly as entered.");
       (d.warnings || []).forEach((w) => toast("warning", "Heads up", w));
-      if (d.status === "created") { known.add(slugify($("title").value)); updateHint(); }
+      if (d.problem) upsert(d.problem);
       $("note").value = "";
     } finally { setBusy(false); }
   });
@@ -810,6 +1156,8 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   document.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") $("f").requestSubmit();
   });
+
+  render();
 })();
 </script>
 </body>
