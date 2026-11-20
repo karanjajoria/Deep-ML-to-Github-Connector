@@ -1,5 +1,6 @@
 """Matrix-Vector Dot Product (easy)
 https://www.deep-ml.com/problems/1
+status: unsolved
 """
 
 def matrix_dot_vector(a: list[list[int|float]], b: list[int|float]) -> list[int|float]:
