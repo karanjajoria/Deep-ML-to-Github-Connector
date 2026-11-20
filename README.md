@@ -36,3 +36,4 @@ curl -X POST https://YOUR-APP.onrender.com/submit \
 curl -X POST .../submit -H ... -d '{"title":"Sigmoid","manual":true,"solved":false}'
 curl -X POST .../api/status -H ... -d '{"slug":"sigmoid","solved":true}'
  
+- [Matrix-Vector Dot Product](solutions/matrix_vector_dot_product.py) · easy · unsolved · [problem](https://www.deep-ml.com/problems/1)
