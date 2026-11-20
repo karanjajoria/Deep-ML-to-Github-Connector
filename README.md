@@ -18,3 +18,4 @@ Commit Deep-ML solutions to GitHub from a web form or API call.
     -d '{"title":"Single Neuron","difficulty":"easy","code":"def f(): ..."}'
 
 Render's free tier sleeps when idle, so the first request may take about 30 seconds.
+- [Matrix-Vector Dot Product](solutions/matrix_vector_dot_product.py) (easy) - [problem](https://www.deep-ml.com/problems/1)
