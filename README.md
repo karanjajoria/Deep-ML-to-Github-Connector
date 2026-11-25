@@ -39,6 +39,6 @@ curl -X POST .../api/status -H ... -d '{"slug":"sigmoid","solved":true}'
 # Live at render
  https://deep-ml-to-github-connector.onrender.com/
  
-- [Matrix-Vector Dot Product](solutions/matrix_vector_dot_product.py) · easy · unsolved · [problem](https://www.deep-ml.com/problems/1)
+- [Matrix-Vector Dot Product](solutions/matrix_vector_dot_product.py) · easy · solved · [problem](https://www.deep-ml.com/problems/371?from=Neural%20Nets%20to%20GPT)
 - [Single Neuron](solutions/single_neuron.py) · easy · solved · [problem](https://www.deep-ml.com/courses/neural-nets-to-gpt/learn?episode=ep1)
 - [Calculate Number of Parameters in Neural Network](solutions/calculate_number_of_parameters_in_neural_network.py) · easy · solved · [problem](https://www.deep-ml.com/problems/371?from=Neural%20Nets%20to%20GPT)
