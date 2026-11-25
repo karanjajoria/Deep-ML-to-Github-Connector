@@ -35,6 +35,9 @@ curl -X POST https://YOUR-APP.onrender.com/submit \
 # manual entry (no code) and status toggle
 curl -X POST .../submit -H ... -d '{"title":"Sigmoid","manual":true,"solved":false}'
 curl -X POST .../api/status -H ... -d '{"slug":"sigmoid","solved":true}'
+
+# Live at render
+ https://deep-ml-to-github-connector.onrender.com/
  
 - [Matrix-Vector Dot Product](solutions/matrix_vector_dot_product.py) · easy · unsolved · [problem](https://www.deep-ml.com/problems/1)
 - [Single Neuron](solutions/single_neuron.py) · easy · solved · [problem](https://www.deep-ml.com/courses/neural-nets-to-gpt/learn?episode=ep1)
