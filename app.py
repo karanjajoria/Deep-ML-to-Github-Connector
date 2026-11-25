@@ -20,7 +20,7 @@ from functools import wraps
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, g, jsonify, redirect, render_template_string, request
+from flask import Flask, abort, g, jsonify, redirect, render_template_string, request, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 logging.basicConfig(level=logging.INFO)
@@ -646,6 +646,20 @@ def solution():
 @app.get("/healthz")
 def health():
     return "ok"
+
+
+# Google Search Console "HTML file" verification. Put the file Google gives you
+# (e.g. google1a2b3c4d5e6f7a8b.html) in the verification/ folder next to this file.
+# Only filenames of that exact shape are served, nothing else can be read from disk.
+VERIFY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verification")
+GOOGLE_FILE_RE = re.compile(r"google[a-f0-9]{10,40}\.html")
+
+
+@app.get("/<name>")
+def google_verification(name):
+    if not GOOGLE_FILE_RE.fullmatch(name):
+        abort(404)
+    return send_from_directory(VERIFY_DIR, name, mimetype="text/html")
 
 
 # --------------------------------------------------------------------------
