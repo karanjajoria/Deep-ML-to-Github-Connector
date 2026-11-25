@@ -15,7 +15,7 @@ import secrets
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import urlparse
 
@@ -360,6 +360,66 @@ def list_problems():
 
 
 # --------------------------------------------------------------------------
+# Activity (commit history of solutions/, used for streaks + heatmap)
+# --------------------------------------------------------------------------
+ACTIVITY_DAYS = 365
+ACTIVITY_MAX_PAGES = 5            # 5 x 100 = latest 500 solution commits
+ACTIVITY_TTL = 60                 # seconds
+ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_activity_cache = {"at": 0.0, "data": None}
+
+
+def _commit_page(since, page):
+    try:
+        r = SESSION.get(
+            f"https://api.github.com/repos/{REPO}/commits",
+            params={"sha": BRANCH, "path": "solutions", "since": since, "per_page": 100, "page": page},
+            timeout=(5, 20),
+        )
+    except requests.RequestException as exc:
+        log.warning("GitHub network error: %s", type(exc).__name__)
+        raise GitHubError(0)
+    if r.status_code == 409:  # empty repository
+        return [], 0
+    if not r.ok:
+        log.warning("GitHub commits -> %s", r.status_code)
+        raise GitHubError(r.status_code)
+    items = r.json()
+    dates = []
+    for c in items:
+        d = ((c.get("commit") or {}).get("author") or {}).get("date")
+        if isinstance(d, str) and ISO_RE.fullmatch(d):
+            dates.append(d)
+    return dates, len(items)
+
+
+def list_activity():
+    now = time.time()
+    with _lock:
+        hit = _activity_cache["data"]
+        if hit is not None and now - _activity_cache["at"] < ACTIVITY_TTL:
+            return hit
+    since = (datetime.now(timezone.utc) - timedelta(days=ACTIVITY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stamps, truncated = [], False
+    for page in range(1, ACTIVITY_MAX_PAGES + 1):
+        dates, n = _commit_page(since, page)
+        stamps.extend(dates)
+        if n < 100:
+            break
+    else:
+        truncated = True
+    data = {"timestamps": stamps, "truncated": truncated}
+    with _lock:
+        _activity_cache.update(at=now, data=data)
+    return data
+
+
+def _bust_activity():
+    with _lock:
+        _activity_cache["data"] = None
+
+
+# --------------------------------------------------------------------------
 # Core sync logic
 # --------------------------------------------------------------------------
 def _retry_conflict(exc, attempt):
@@ -398,6 +458,8 @@ def sync(title, code, difficulty, url, note, solved):
                 continue
             raise
 
+    if status != "unchanged":
+        _bust_activity()
     warnings = []
     try:
         update_readme(use_title, slug, difficulty, use_url, solved, is_manual)
@@ -434,6 +496,8 @@ def set_status(slug, solved):
             if _retry_conflict(exc, attempt):
                 continue
             raise
+    if status == "updated":
+        _bust_activity()
     warnings = []
     try:
         update_readme(rec["title"], slug, rec["difficulty"], rec["url"], solved, rec["manual"])
@@ -628,6 +692,15 @@ def problems():
         return github_failure(exc)
 
 
+@app.get("/api/activity")
+@protected
+def activity():
+    try:
+        return jsonify(ok=True, **list_activity())
+    except GitHubError as exc:
+        return github_failure(exc)
+
+
 @app.get("/api/solution")
 @protected
 def solution():
@@ -677,10 +750,12 @@ PAGE = r"""<!doctype html>
 <style nonce="{{ nonce }}">
 :root{--bg:#0d1117;--subtle:#161b22;--inset:#010409;--border:#30363d;--fg:#e6edf3;--muted:#8b949e;
 --accent:#4493f8;--green:#238636;--green-h:#2ea043;--red:#f85149;--amber:#d29922;--blue:#1f6feb;
---btn:#21262d;--btn-h:#30363d;--shadow:0 8px 24px rgba(1,4,9,.6)}
+--btn:#21262d;--btn-h:#30363d;--shadow:0 8px 24px rgba(1,4,9,.6);
+--h0:#151b23;--h1:#0e4429;--h2:#006d32;--h3:#26a641;--h4:#39d353}
 @media (prefers-color-scheme:light){:root{--bg:#ffffff;--subtle:#f6f8fa;--inset:#f6f8fa;--border:#d0d7de;
 --fg:#1f2328;--muted:#59636e;--accent:#0969da;--green:#1f883d;--green-h:#1a7f37;--red:#d1242f;--amber:#9a6700;
---blue:#0969da;--btn:#f6f8fa;--btn-h:#eaeef2;--shadow:0 8px 24px rgba(140,149,159,.35)}}
+--blue:#0969da;--btn:#f6f8fa;--btn-h:#eaeef2;--shadow:0 8px 24px rgba(140,149,159,.35);
+--h0:#eff2f5;--h1:#aceebb;--h2:#4ac26b;--h3:#2da44e;--h4:#116329}}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 html,body{margin:0}
@@ -776,6 +851,29 @@ font-size:12px;font-weight:500;color:var(--fg);cursor:pointer}
 .pgh{color:var(--muted);display:flex}.pgh:hover{color:var(--accent)}.pgh svg{width:16px;height:16px}
 .slabel{font-size:12px;color:var(--muted);width:56px;text-align:right}
 .empty{padding:24px 16px;text-align:center;color:var(--muted)}
+/* stats */
+.muted-s{color:var(--muted);font-weight:400;font-size:12px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media (max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}}
+.stat{border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--subtle)}
+.stat .sv{font-size:24px;font-weight:600;line-height:1.25}
+.stat .sl{color:var(--muted);font-size:12px}
+.sub{font-size:14px;font-weight:600;margin:24px 0 10px}
+.drow{display:grid;grid-template-columns:64px 1fr 48px;align-items:center;gap:12px;margin-bottom:8px;font-size:13px}
+.drow .n{text-align:right;color:var(--muted)}
+.bar{height:8px;border-radius:4px;background:var(--btn-h);overflow:hidden}
+.bar i{display:block;height:100%;border-radius:4px}
+.bar .easy{background:var(--green-h)}.bar .medium{background:var(--amber)}.bar .hard{background:var(--red)}.bar .other{background:var(--accent)}
+.heat-wrap{overflow-x:auto;padding-bottom:4px}
+.months,.heat{display:grid;grid-auto-flow:column;grid-auto-columns:10px;gap:3px;width:max-content}
+.months{grid-template-rows:14px;margin-bottom:4px;font-size:11px;color:var(--muted)}
+.months span{white-space:nowrap}
+.heat{grid-template-rows:repeat(7,10px)}
+.cell{display:block;width:10px;height:10px;border-radius:2px;background:var(--h0);outline:1px solid rgba(128,128,128,.14);outline-offset:-1px}
+.l1{background:var(--h1)}.l2{background:var(--h2)}.l3{background:var(--h3)}.l4{background:var(--h4)}
+.legend{display:flex;align-items:center;justify-content:flex-end;gap:4px;font-size:12px;color:var(--muted);margin-top:8px}
+.legend .cell{display:inline-block}
+#act-msg{color:var(--muted)}
 /* toasts */
 #toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:50;width:min(380px,calc(100vw - 32px))}
 .toast{display:flex;gap:10px;align-items:flex-start;background:var(--subtle);border:1px solid var(--border);
@@ -882,6 +980,28 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     </div>
   </form>
 
+  <section class="box" aria-labelledby="stats-h">
+    <div class="box-header">
+      <span id="stats-h">Stats</span><span class="grow"></span>
+      <span class="muted-s">From your saved problems and commit history</span>
+    </div>
+    <div class="box-body">
+      <div class="empty" id="stats-empty">Enter your app key above to see your stats.</div>
+      <div id="stats-content" hidden>
+        <div class="stats" id="stat-cards"></div>
+        <h3 class="sub">By difficulty</h3>
+        <div id="diff-bars"></div>
+        <h3 class="sub" id="act-title">Activity</h3>
+        <p id="act-msg" hidden></p>
+        <div class="heat-wrap" id="heat-wrap" hidden>
+          <div class="months" id="months"></div>
+          <div class="heat" id="heat" role="img" aria-label="Solution commits over the last year"></div>
+        </div>
+        <div class="legend" id="legend" hidden>Less <i class="cell l0"></i><i class="cell l1"></i><i class="cell l2"></i><i class="cell l3"></i><i class="cell l4"></i> More</div>
+      </div>
+    </div>
+  </section>
+
   <section class="box" aria-labelledby="ptitle-h">
     <div class="box-header">
       <span id="ptitle-h">Your problems</span> <span class="count" id="pcount">0</span>
@@ -939,7 +1059,8 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   "use strict";
   const $ = (id) => document.getElementById(id);
   const MAX_CODE = {{ max_code }};
-  let problems = [], known = new Set(), lastKey = "", busy = false, unlocked = false, filter = "all", hintTimer;
+  let problems = [], known = new Set(), lastKey = "", busy = false, unlocked = false, filter = "all", hintTimer,
+      activity = null, activityMsg = "", activityTruncated = false;
 
   const svg = (inner) => '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + "</svg>";
   const ICONS = {
@@ -1042,6 +1163,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       const r = await api("/api/status", { method: "POST", body: JSON.stringify({ slug: p.slug, solved: want }) });
       sw.input.disabled = false;
       if (r.networkError || !r.res.ok) { sw.input.checked = !want; return failToast(r); }
+      if (r.data.status === "updated") bumpActivity();
       upsert(r.data.problem);
       toast("success", want ? "Marked as solved" : "Marked as unsolved", p.title, r.data.commit_url);
       (r.data.warnings || []).forEach((w) => toast("warning", "Heads up", w));
@@ -1074,7 +1196,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     known = new Set(problems.map((p) => p.slug));
     const dl = $("problems"); dl.replaceChildren();
     problems.forEach((p) => { const o = document.createElement("option"); o.value = p.title; dl.appendChild(o); });
-    renderList(); updateHint();
+    renderList(); updateHint(); renderStats();
   }
 
   function upsert(p) {
@@ -1085,9 +1207,126 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
 
   async function refreshList(announce) {
     const r = await api("/api/problems");
-    if (r.networkError || !r.res.ok) { lastKey = ""; unlocked = false; problems = []; render(); return failToast(r); }
+    if (r.networkError || !r.res.ok) {
+      lastKey = ""; unlocked = false; problems = []; activity = null; render(); failToast(r); return false;
+    }
     unlocked = true; problems = r.data.problems; render();
     if (announce) toast("info", "Unlocked", problems.length + " problem" + (problems.length === 1 ? "" : "s") + " found.");
+    return true;
+  }
+
+  async function loadActivity() {
+    const r = await api("/api/activity");
+    if (r.networkError || !r.res.ok) {
+      activity = null;
+      activityMsg = r.networkError ? "Activity couldn't be loaded (network error)." : ((r.data && r.data.error) || "Activity couldn't be loaded.");
+    } else {
+      activity = r.data.timestamps || []; activityTruncated = !!r.data.truncated; activityMsg = "";
+    }
+    renderStats();
+  }
+
+  async function unlockAndLoad(announce) {
+    const ok = await refreshList(announce);   // activity only loads after the key is accepted
+    if (ok) await loadActivity();
+    return ok;
+  }
+
+  /* ---------- stats ---------- */
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const dayKey = (d) => d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+  const midnight = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const plural = (n, w) => n + " " + w + (n === 1 ? "" : "s");
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function bumpActivity() {   // show a fresh commit immediately; GitHub's list can lag a few seconds
+    if (Array.isArray(activity)) { activity.push(new Date().toISOString()); renderStats(); }
+  }
+
+  function streaks(counts) {
+    const today = midnight(new Date());
+    let longest = 0, run = 0;
+    for (let i = 364; i >= 0; i--) {
+      if (counts.get(dayKey(addDays(today, -i)))) { run++; if (run > longest) longest = run; } else run = 0;
+    }
+    let cur = 0, d = today;
+    if (!counts.get(dayKey(d))) d = addDays(d, -1);   // today not done yet: streak still alive until midnight
+    while (counts.get(dayKey(d))) { cur++; d = addDays(d, -1); }
+    return { current: cur, longest: longest };
+  }
+
+  function drawHeat(counts) {
+    const heat = $("heat"), months = $("months");
+    heat.replaceChildren(); months.replaceChildren();
+    const today = midnight(new Date());
+    const start = addDays(today, -(52 * 7 + today.getDay()));   // a Sunday, 53 weekly columns like GitHub
+    let lastMonth = -1;
+    for (let d = new Date(start); d <= today; d = addDays(d, 1)) {
+      if (d.getDay() === 0) {
+        const label = el("span");
+        if (d.getDate() <= 7 && d.getMonth() !== lastMonth) { label.textContent = MONTHS[d.getMonth()]; lastMonth = d.getMonth(); }
+        months.appendChild(label);
+      }
+      const n = counts.get(dayKey(d)) || 0;
+      const cell = el("i", "cell l" + (n === 0 ? 0 : n === 1 ? 1 : n === 2 ? 2 : n <= 4 ? 3 : 4));
+      cell.title = plural(n, "commit") + " on " + d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+      heat.appendChild(cell);
+    }
+  }
+
+  function renderStats() {
+    $("stats-empty").hidden = unlocked;
+    $("stats-content").hidden = !unlocked;
+    if (!unlocked) return;
+
+    const total = problems.length, solved = problems.filter((p) => p.solved).length;
+    const manual = problems.filter((p) => p.manual).length;
+    const counts = new Map();
+    (activity || []).forEach((ts) => {
+      const d = new Date(ts);
+      if (!isNaN(d)) { const k = dayKey(d); counts.set(k, (counts.get(k) || 0) + 1); }
+    });
+    const st = streaks(counts);
+
+    const cards = $("stat-cards"); cards.replaceChildren();
+    const card = (v, l) => { const c = el("div", "stat"); c.append(el("div", "sv", v), el("div", "sl", l)); cards.appendChild(c); };
+    card(solved + " / " + total, "Solved");
+    card((total ? Math.round(solved * 100 / total) : 0) + "%", "Completion");
+    card(String(total - solved), "Unsolved");
+    card(String(manual), "Manual entries (no code)");
+    card(activity ? plural(st.current, "day") : "\u2013", "Current streak");
+    card(activity ? plural(st.longest, "day") : "\u2013", "Longest streak (last year)");
+
+    const bars = $("diff-bars"); bars.replaceChildren();
+    const addBar = (cls, label, list) => {
+      const s = list.filter((p) => p.solved).length;
+      const row = el("div", "drow"), track = el("div", "bar"), fill = el("i", cls);
+      fill.style.width = (list.length ? s * 100 / list.length : 0) + "%";
+      track.appendChild(fill);
+      row.append(el("span", null, label), track, el("span", "n", s + "/" + list.length));
+      bars.appendChild(row);
+    };
+    const levels = ["easy", "medium", "hard"];
+    levels.forEach((lv) => addBar(lv, lv.charAt(0).toUpperCase() + lv.slice(1), problems.filter((p) => p.difficulty === lv)));
+    const other = problems.filter((p) => levels.indexOf(p.difficulty) < 0);
+    if (other.length) addBar("other", "Other", other);
+
+    if (activity === null) {
+      $("act-title").textContent = "Activity";
+      $("heat-wrap").hidden = true; $("legend").hidden = true;
+      $("act-msg").hidden = false; $("act-msg").textContent = activityMsg || "Loading activity\u2026";
+      return;
+    }
+    $("act-msg").hidden = true; $("heat-wrap").hidden = false; $("legend").hidden = false;
+    $("act-title").textContent = plural(activity.length, "commit") + " in the last year \u00b7 " +
+      plural(counts.size, "active day") + (activityTruncated ? " (latest " + activity.length + " shown)" : "");
+    drawHeat(counts);
   }
 
   /* ---------- form ---------- */
@@ -1124,10 +1363,10 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
 
   $("key").addEventListener("change", () => {
     const k = $("key").value;
-    if (!k) { lastKey = ""; unlocked = false; problems = []; render(); return; }
+    if (!k) { lastKey = ""; unlocked = false; problems = []; activity = null; render(); return; }
     if (k === lastKey) return;
     lastKey = k;
-    refreshList(true);
+    unlockAndLoad(true);
   });
   $("title").addEventListener("input", () => { clearTimeout(hintTimer); hintTimer = setTimeout(updateHint, 150); });
   $("code").addEventListener("input", () => { $("count").textContent = $("code").value.length + " / " + MAX_CODE; });
@@ -1135,8 +1374,8 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   $("load").addEventListener("click", () => loadInto(slugify($("title").value)));
   $("refresh").addEventListener("click", async () => {
     if (!$("key").value) return toast("warning", "App key needed", "Enter your app key first.");
-    await refreshList(false);
-    if (unlocked) toast("info", "Refreshed", problems.length + " problem" + (problems.length === 1 ? "" : "s") + " loaded.");
+    const ok = await unlockAndLoad(false);
+    if (ok) toast("info", "Refreshed", problems.length + " problem" + (problems.length === 1 ? "" : "s") + " loaded.");
   });
   document.querySelectorAll("#seg button").forEach((b) => b.addEventListener("click", () => { filter = b.dataset.f; renderList(); }));
 
@@ -1162,6 +1401,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       else if (d.status === "updated") toast("success", entry ? "Entry updated" : "Solution updated", "Updated " + d.path + tag + ". Same file, new version.", d.commit_url);
       else toast("info", "No changes", "This is already committed exactly as entered.");
       (d.warnings || []).forEach((w) => toast("warning", "Heads up", w));
+      if (d.status !== "unchanged") bumpActivity();
       if (d.problem) upsert(d.problem);
       $("note").value = "";
     } finally { setBusy(false); }
