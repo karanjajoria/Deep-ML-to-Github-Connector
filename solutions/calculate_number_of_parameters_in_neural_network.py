@@ -20,9 +20,25 @@ def calculate_parameters(layers: list[dict]) -> int:
 
     for element in layers:
         if element["type"] == "dense":
-            if element["bias"] == True:
+            if "bias" in element:
+                if element["bias"] == True:
+                    temp = element["input_size"] * element["output_size"] + element["output_size"]
+                    total_params += temp
+                elif element["bias"] == False:
+                    temp = element["input_size"] * element["output_size"]
+                    total_params += temp
+            else:
                 temp = element["input_size"] * element["output_size"] + element["output_size"]
-        total_params += temp
+                total_params += temp
+
+        if element["type"] == "conv2d":
+            if element["bias"] == True:
+                temp = element["in_channels"] * element["out_channels"] * element["kernel_size"]**2 + element["out_channels"]
+                total_params += temp
+            elif element["bias"] == False:
+                temp = element["in_channels"] * element["out_channels"] * (element["kernel_size"]**2)
+                total_params += temp
+
     pass
 
     return total_params
