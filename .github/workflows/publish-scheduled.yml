@@ -1,0 +1,28 @@
+name: Publish scheduled solutions
+
+on:
+  schedule:
+    # Every 15 minutes (odd minutes avoid GitHub's busy top-of-hour slots)
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch: {}
+
+permissions: {}   # this job needs no access to the repo; it only calls your app
+
+concurrency:
+  group: publish-scheduled
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask the app to publish anything that is due
+        env:
+          APP_URL: ${{ secrets.DEEPML_APP_URL }}
+          APP_KEY: ${{ secrets.DEEPML_APP_KEY }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --retry 4 --retry-delay 20 --retry-all-errors --max-time 100 \
+            -X POST "$APP_URL/api/run-due" \
+            -H "X-API-Key: $APP_KEY"
