@@ -6,7 +6,8 @@ on:
     - cron: "3,18,33,48 * * * *"
   workflow_dispatch: {}
 
-permissions: {}   # this job needs no access to the repo; it only calls your app
+permissions:
+  issues: write   # only used to create the notification issue below
 
 concurrency:
   group: publish-scheduled
@@ -25,4 +26,53 @@ jobs:
           curl --fail-with-body --silent --show-error \
             --retry 4 --retry-delay 20 --retry-all-errors --max-time 100 \
             -X POST "$APP_URL/api/run-due" \
-            -H "X-API-Key: $APP_KEY"
+            -H "X-API-Key: $APP_KEY" \
+            -o "$RUNNER_TEMP/resp.json"
+
+      # GitHub emails you when an issue is assigned to you. Nothing is created
+      # on runs where nothing was published.
+      - name: Notify me (GitHub issue assigned to me -> email)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/resp.json"
+          pub=$(jq '[.published[]? | select(.status != "unchanged")] | length' "$f")
+          fail=$(jq '[.failed[]?] | length' "$f")
+          if [ "$pub" -eq 0 ] && [ "$fail" -eq 0 ]; then echo "Nothing to report."; exit 0; fi
+
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "@$GITHUB_REPOSITORY_OWNER"
+            if [ "$pub" -gt 0 ]; then
+              echo
+              echo "### Published to \`$GITHUB_REF_NAME\`"
+              jq -r --arg repo "$GITHUB_REPOSITORY" --arg br "$GITHUB_REF_NAME" '
+                .published[] | select(.status != "unchanged")
+                | "- **\(.title)**: [\(.path)](https://github.com/\($repo)/blob/\($br)/\(.path))"
+                  + (if (.commit_url // "") != "" then " ([commit](\(.commit_url)))" else "" end)' "$f"
+            fi
+            if [ "$fail" -gt 0 ]; then
+              echo
+              echo "### Problems"
+              jq -r '.failed[] | "- **\(.title)**: \(.error)"' "$f"
+            fi
+            echo
+            echo "_Sent by the Publish scheduled solutions workflow. Close this issue whenever you like._"
+          } > "$body"
+
+          if [ "$pub" -eq 1 ]; then
+            title="Published: $(jq -r '[.published[] | select(.status != "unchanged")][0].title' "$f")"
+          elif [ "$pub" -gt 1 ]; then
+            title="Published $pub scheduled solutions"
+          else
+            title="Scheduled publish had $fail problem(s)"
+          fi
+          title=$(printf '%s' "$title" | cut -c1-120)
+
+          gh label create scheduled-publish --repo "$GITHUB_REPOSITORY" --color 2ea043 \
+            --description "Scheduled commit notifications" --force >/dev/null 2>&1 || true
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body" \
+            --label scheduled-publish --assignee "$GITHUB_REPOSITORY_OWNER" \
+          || gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body" \
+            --label scheduled-publish
