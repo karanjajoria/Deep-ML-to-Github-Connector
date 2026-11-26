@@ -62,3 +62,4 @@ Things to know
 - GitHub pauses scheduled workflows after 60 days without repo activity; your regular commits keep it alive.
 - At most 30 pending items, at most 60 days ahead, at most 5 published per run (extras go out on the next run).
 - Each timer call wakes the Render app, so on the free tier it will stay awake most of the time (free instance hours are shared across your workspace).
+- [Testing schedule feature](solutions/testing_schedule_feature.py) · easy · solved
