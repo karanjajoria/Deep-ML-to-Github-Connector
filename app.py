@@ -673,7 +673,7 @@ def run_due(only_id=None):
         for e in batch:
             try:
                 res = publish_entry(e)
-                published.append({"title": res["problem"]["title"], "path": res["path"], "status": res["status"]})
+                published.append({"title": res["problem"]["title"], "path": res["path"], "status": res["status"], "commit_url": res["commit_url"]})
             except LookupError:
                 continue
             except ValueError:
