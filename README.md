@@ -1,13 +1,16 @@
 # deepml-sync
- 
+
 Commit Deep-ML solutions to GitHub from a GitHub-styled web page or an API call.
 Re-committing the same problem updates its existing file (one file per problem, history in git).
- 
+
 ## Features
 - **Solved toggle**: mark a problem solved or unsolved when committing, or flip it later from the problem list (makes a small "Mark solved/unsolved" commit).
 - **Manual entry**: log a problem with no code (e.g. one you're still working on). Add the code later by committing the same title again. A manual update never overwrites code you already saved.
 - **Your problems** list: newest first, filter All / Solved / Unsolved, click a title to load it into the form, link to the file on GitHub.
+- **Stats** panel: solved / total, completion %, unsolved, manual entries, current and longest streak, a per-difficulty progress breakdown, and a GitHub-style activity heatmap (last 12 months). Streaks and the heatmap use your browser's timezone. They come from the commit history of `solutions/` (latest 500 commits, cached for 60 s); README-only commits aren't counted.
+- **Scheduled commits**: turn on "Schedule for later", pick a date/time (shortcuts for Saturday, Sunday, tomorrow) and the solution is queued. A GitHub Actions timer publishes it when due. The *Scheduled* list lets you **Publish now** or **Cancel**.
 - Header: the GitHub logo is the home button (your GitHub profile); "Deep-ML / Sync" opens your solutions repo.
+
 ## Setup
 1. Create a repo (e.g. `deep-ml-solutions`) with a README so `main` exists.
 2. GitHub > Settings > Developer settings > Fine-grained tokens: limit to that repo, **Contents: Read and write**.
@@ -20,6 +23,7 @@ Re-committing the same problem updates its existing file (one file per problem, 
    - `GITHUB_BRANCH` (default `main`), `GITHUB_URL` (default your GitHub profile)
    - `REPO_URL` (optional) overrides where "Deep-ML / Sync" links; defaults to `https://github.com/<GITHUB_REPO>`
 5. Verify your GitHub account email so commits show on your contribution graph.
+
 ## Security
 - HTTPS enforced (HTTP redirects), HSTS, strict CSP with per-request nonce, no cookies, no framing, no-store caching.
 - App key is compared in constant time; 5 wrong keys locks an IP for 15 min; 60 requests/min/IP limit.
@@ -27,18 +31,34 @@ Re-committing the same problem updates its existing file (one file per problem, 
 - GitHub token only in Render env vars, never sent to the browser or logged. Errors shown to you never include raw GitHub responses.
 - Your code is passed straight to GitHub and not stored on the server.
 - Limits: the rate limiter lives in memory (resets on restart/sleep) and the app key is a single shared secret. Rotate both the key and token if you ever suspect a leak.
+
 ## API
 curl -X POST https://YOUR-APP.onrender.com/submit \
   -H "X-API-Key: $APP_KEY" -H "Content-Type: application/json" \
   -d '{"title":"Single Neuron","difficulty":"easy","solved":true,"code":"def f(): ...","note":"optional commit message"}'
- 
+
+# read-only: GET /api/problems, GET /api/activity (same X-API-Key header)
+
 # manual entry (no code) and status toggle
 curl -X POST .../submit -H ... -d '{"title":"Sigmoid","manual":true,"solved":false}'
 curl -X POST .../api/status -H ... -d '{"slug":"sigmoid","solved":true}'
 
-# Live at render
- https://deep-ml-to-github-connector.onrender.com/
- 
-- [Matrix-Vector Dot Product](solutions/matrix_vector_dot_product.py) · easy · solved · [problem](https://www.deep-ml.com/problems/371?from=Neural%20Nets%20to%20GPT)
-- [Single Neuron](solutions/single_neuron.py) · easy · solved · [problem](https://www.deep-ml.com/courses/neural-nets-to-gpt/learn?episode=ep1)
-- [Calculate Number of Parameters in Neural Network](solutions/calculate_number_of_parameters_in_neural_network.py) · easy · solved · [problem](https://www.deep-ml.com/problems/371?from=Neural%20Nets%20to%20GPT)
+
+## Scheduled commits: one-time setup
+How it works: queued items are saved as small JSON files on a separate branch (`deepml-queue`, created automatically). Commits on a non-default branch don't count on your contribution graph, so nothing shows up when you *schedule*. A GitHub Actions workflow calls `POST /api/run-due` on your app every 15 minutes; the app publishes anything due to `main` as a real commit (dated when it is published, never backdated), then deletes the queue file.
+
+1. Make sure `.github/workflows/publish-scheduled.yml` is at the **root of your repo** on the default branch (scheduled workflows only run from there).
+2. Repo > Settings > Secrets and variables > Actions > New repository secret:
+   - `DEEPML_APP_URL`  `https://deep-ml-to-github-connector.onrender.com` (no trailing slash)
+   - `DEEPML_APP_KEY`  the same value as your `APP_KEY` on Render
+3. In Render, set the start command to `gunicorn app:app --workers 1 --threads 4 --timeout 120` (already in `render.yaml`; edit it by hand if you created the service manually).
+4. Test it: schedule something a couple of minutes ahead, then Actions tab > "Publish scheduled solutions" > Run workflow.
+5. Optional env var: `QUEUE_BRANCH` (default `deepml-queue`).
+
+Things to know
+- Timing is approximate: GitHub's scheduler can run a few minutes late, so expect publishing within roughly 15-30 minutes after the chosen time.
+- If the repo is **public**, scheduled code is visible on the `deepml-queue` branch before it's published.
+- Private repos: Actions minutes are limited (2,000/month free). Change the cron to hourly (`"7 * * * *"`) to stay under it.
+- GitHub pauses scheduled workflows after 60 days without repo activity; your regular commits keep it alive.
+- At most 30 pending items, at most 60 days ahead, at most 5 published per run (extras go out on the next run).
+- Each timer call wakes the Render app, so on the free tier it will stay awake most of the time (free instance hours are shared across your workspace).
