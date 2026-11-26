@@ -5,7 +5,7 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     # One worker so the in-memory rate limiter is shared across all requests
-    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 30
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
     healthCheckPath: /healthz
     envVars:
       - key: GITHUB_TOKEN
