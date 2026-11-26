@@ -7,6 +7,7 @@ solved/unsolved, and "manual entries" log a problem without any code.
 """
 import base64
 import hashlib
+import json
 import hmac
 import logging
 import os
@@ -55,6 +56,9 @@ if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO):
     raise RuntimeError("GITHUB_REPO must look like 'owner/repo'")
 if not re.fullmatch(r"[A-Za-z0-9._/-]+", BRANCH):
     raise RuntimeError("GITHUB_BRANCH contains unsupported characters")
+QUEUE_BRANCH = _env("QUEUE_BRANCH", "deepml-queue")
+if not re.fullmatch(r"[A-Za-z0-9._/-]+", QUEUE_BRANCH) or QUEUE_BRANCH == BRANCH:
+    raise RuntimeError("QUEUE_BRANCH must be a valid branch name different from GITHUB_BRANCH")
 if len(APP_KEY) < 16:
     raise RuntimeError("APP_KEY must be at least 16 characters (use a long random string)")
 
@@ -104,8 +108,8 @@ def _gh(method, path, **kwargs):
         raise GitHubError(0)
 
 
-def get_file(path):
-    r = _gh("GET", path, params={"ref": BRANCH})
+def get_file(path, branch=None):
+    r = _gh("GET", path, params={"ref": branch or BRANCH})
     if r.status_code == 404:
         return None, None
     if not r.ok:
@@ -117,11 +121,11 @@ def get_file(path):
     return base64.b64decode(data["content"]).decode("utf-8"), data["sha"]
 
 
-def put_file(path, content, message, sha=None):
+def put_file(path, content, message, sha=None, branch=None):
     body = {
         "message": message,
         "content": base64.b64encode(content.encode("utf-8")).decode(),
-        "branch": BRANCH,
+        "branch": branch or BRANCH,
     }
     if sha:
         body["sha"] = sha
@@ -130,6 +134,21 @@ def put_file(path, content, message, sha=None):
         log.warning("GitHub PUT %s -> %s", path, r.status_code)
         raise GitHubError(r.status_code)
     return r.json().get("commit", {}).get("html_url", "")
+
+
+def delete_file(path, sha, message, branch=None):
+    r = _gh("DELETE", path, json={"message": message, "sha": sha, "branch": branch or BRANCH})
+    if not r.ok:
+        log.warning("GitHub DELETE %s -> %s", path, r.status_code)
+        raise GitHubError(r.status_code)
+
+
+def _git(method, path, **kwargs):
+    try:
+        return SESSION.request(method, f"https://api.github.com/repos/{REPO}/git/{path}", timeout=(5, 20), **kwargs)
+    except requests.RequestException as exc:
+        log.warning("GitHub network error: %s", type(exc).__name__)
+        raise GitHubError(0)
 
 
 def list_solutions():
@@ -217,6 +236,37 @@ def clean_bool(value, default):
     if isinstance(value, bool):
         return value
     raise ValueError("Options must be true or false.")
+
+
+def parse_submission(data):
+    manual = clean_bool(data.get("manual"), False)
+    return {
+        "title": clean_title(data.get("title")),
+        "code": clean_code(data.get("code"), required=not manual),
+        "difficulty": clean_difficulty(data.get("difficulty")),
+        "url": clean_url(data.get("url")),
+        "note": clean_note(data.get("note")),
+        "solved": clean_bool(data.get("solved"), True),
+        "manual": manual,
+    }
+
+
+RUN_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+
+def parse_run_at(value):
+    if not isinstance(value, str) or not RUN_AT_RE.fullmatch(value):
+        raise ValueError("Pick a valid date and time.")
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise ValueError("Pick a valid date and time.")
+    now = datetime.now(timezone.utc)
+    if dt < now + timedelta(seconds=30):
+        raise ValueError("Pick a time at least a minute in the future.")
+    if dt > now + timedelta(days=60):
+        raise ValueError("You can schedule at most 60 days ahead.")
+    return dt
 
 
 # --------------------------------------------------------------------------
@@ -508,6 +558,137 @@ def set_status(slug, solved):
 
 
 # --------------------------------------------------------------------------
+# Scheduled commits. The queue lives on a NON-default branch (QUEUE_BRANCH), so
+# queueing never appears on your contribution graph. Publishing later makes the
+# real commit on the default branch, dated at publish time (nothing is backdated).
+# One file per item: queue/<YYYYMMDDTHHMMSSZ>_<id>_<slug>.json
+# --------------------------------------------------------------------------
+QUEUE_DIR = "queue"
+MAX_PENDING = 30
+MAX_PER_RUN = 5
+QUEUE_NAME_RE = re.compile(r"(\d{8}T\d{6}Z)_([0-9a-f]{8})_([a-z0-9_]{1,100})\.json")
+ID_RE = re.compile(r"[0-9a-f]{8}")
+_run_lock = threading.Lock()
+
+
+class QueueFull(Exception):
+    pass
+
+
+class Busy(Exception):
+    pass
+
+
+def _compact_to_iso(c):
+    return f"{c[0:4]}-{c[4:6]}-{c[6:8]}T{c[9:11]}:{c[11:13]}:{c[13:15]}Z"
+
+
+def ensure_queue_branch():
+    r = _git("GET", f"ref/heads/{QUEUE_BRANCH}")
+    if r.ok:
+        return
+    if r.status_code != 404:
+        raise GitHubError(r.status_code)
+    base = _git("GET", f"ref/heads/{BRANCH}")
+    if not base.ok:
+        raise GitHubError(base.status_code)
+    c = _git("POST", "refs", json={"ref": f"refs/heads/{QUEUE_BRANCH}", "sha": base.json()["object"]["sha"]})
+    if not c.ok and c.status_code != 422:  # 422 = created by a parallel request
+        raise GitHubError(c.status_code)
+
+
+def list_queue():
+    r = _gh("GET", QUEUE_DIR, params={"ref": QUEUE_BRANCH})
+    if r.status_code == 404:
+        return []
+    if not r.ok:
+        raise GitHubError(r.status_code)
+    out = []
+    for it in r.json():
+        m = QUEUE_NAME_RE.fullmatch(it.get("name", ""))
+        if m and it.get("type") == "file":
+            out.append({
+                "id": m.group(2),
+                "run_at": _compact_to_iso(m.group(1)),
+                "slug": m.group(3),
+                "title": m.group(3).replace("_", " ").title(),
+                "name": it["name"],
+                "sha": it["sha"],
+            })
+    return sorted(out, key=lambda e: (e["run_at"], e["id"]))
+
+
+def _public(entry):
+    return {k: entry[k] for k in ("id", "run_at", "slug", "title")}
+
+
+def enqueue(item, run_at):
+    ensure_queue_branch()
+    if len(list_queue()) >= MAX_PENDING:
+        raise QueueFull()
+    qid = secrets.token_hex(4)
+    stamp = run_at.strftime("%Y%m%dT%H%M%SZ")
+    slug = slugify(item["title"])
+    name = f"{stamp}_{qid}_{slug}.json"
+    put_file(f"{QUEUE_DIR}/{name}", json.dumps(item), f"Schedule: {item['title']}", branch=QUEUE_BRANCH)
+    return {"id": qid, "run_at": _compact_to_iso(stamp), "slug": slug, "title": slug.replace("_", " ").title()}
+
+
+def _drop(path, sha, message):
+    try:
+        delete_file(path, sha, message, QUEUE_BRANCH)
+    except GitHubError:
+        log.warning("could not remove queue item %s", path)  # next run is idempotent (unchanged)
+
+
+def publish_entry(entry):
+    path = f"{QUEUE_DIR}/{entry['name']}"
+    text, sha = get_file(path, QUEUE_BRANCH)
+    if text is None:
+        raise LookupError(entry["id"])
+    try:
+        item = parse_submission(json.loads(text))   # re-validated: never trust stored data
+    except (ValueError, TypeError, AttributeError):
+        _drop(path, sha, "Discard invalid scheduled item")
+        raise ValueError("invalid scheduled item")
+    result = sync(item["title"], item["code"], item["difficulty"], item["url"], item["note"], item["solved"])
+    _drop(path, sha, f"Published: {item['title']}")
+    return result
+
+
+def run_due(only_id=None):
+    if not _run_lock.acquire(timeout=25):
+        raise Busy()
+    try:
+        pending = list_queue()
+        if only_id:
+            due = [e for e in pending if e["id"] == only_id]
+            if not due:
+                raise LookupError(only_id)
+            return {"result": publish_entry(due[0])}
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        due = [e for e in pending if e["run_at"] <= now]
+        batch = due[:MAX_PER_RUN]
+        published, failed = [], []
+        for e in batch:
+            try:
+                res = publish_entry(e)
+                published.append({"title": res["problem"]["title"], "path": res["path"], "status": res["status"]})
+            except LookupError:
+                continue
+            except ValueError:
+                failed.append({"id": e["id"], "title": e["title"], "error": "Invalid item was discarded."})
+            except GitHubError as exc:
+                failed.append({"id": e["id"], "title": e["title"], "error": gh_message(exc.status)})
+                if exc.status in (401, 403):
+                    break  # token problem: don't hammer GitHub
+        log.info("run-due: %d published, %d failed, %d still due", len(published), len(failed), len(due) - len(batch))
+        return {"published": published, "failed": failed, "remaining": len(due) - len(batch)}
+    finally:
+        _run_lock.release()
+
+
+# --------------------------------------------------------------------------
 # Security: HTTPS, headers, auth, throttling
 # --------------------------------------------------------------------------
 _lock = threading.Lock()
@@ -611,16 +792,22 @@ def _boom(exc):
     return err("Unexpected server error.", 500)
 
 
+GH_MESSAGES = {
+    0: "Couldn't reach GitHub. Try again in a moment.",
+    401: "GitHub rejected the token (expired or revoked). Generate a new one.",
+    403: "GitHub denied access or hit a rate limit. Check the token's Contents permission.",
+    404: "Repo or branch not found, or the token can't access it.",
+    409: "The file changed on GitHub while saving. Try again.",
+    422: "GitHub couldn't process the commit. Try again.",
+}
+
+
+def gh_message(status):
+    return GH_MESSAGES.get(status, "GitHub returned an error.")
+
+
 def github_failure(exc):
-    messages = {
-        0: "Couldn't reach GitHub. Try again in a moment.",
-        401: "GitHub rejected the token (expired or revoked). Generate a new one.",
-        403: "GitHub denied access or hit a rate limit. Check the token's Contents permission.",
-        404: "Repo or branch not found, or the token can't access it.",
-        409: "The file changed on GitHub while saving. Try again.",
-        422: "GitHub couldn't process the commit. Try again.",
-    }
-    return err(messages.get(exc.status, "GitHub returned an error."), 502)
+    return err(gh_message(exc.status), 502)
 
 
 # --------------------------------------------------------------------------
@@ -647,17 +834,11 @@ def submit():
     if not isinstance(data, dict):
         return err("Send a JSON body with Content-Type: application/json.", 400)
     try:
-        manual = clean_bool(data.get("manual"), False)
-        solved = clean_bool(data.get("solved"), True)
-        title = clean_title(data.get("title"))
-        code = clean_code(data.get("code"), required=not manual)
-        difficulty = clean_difficulty(data.get("difficulty"))
-        url = clean_url(data.get("url"))
-        note = clean_note(data.get("note"))
+        item = parse_submission(data)
     except ValueError as exc:
         return err(str(exc), 400)
     try:
-        result = sync(title, code, difficulty, url, note, solved)
+        result = sync(item["title"], item["code"], item["difficulty"], item["url"], item["note"], item["solved"])
     except GitHubError as exc:
         return github_failure(exc)
     return jsonify(ok=True, **result)
@@ -688,6 +869,79 @@ def status_route():
 def problems():
     try:
         return jsonify(ok=True, problems=list_problems())
+    except GitHubError as exc:
+        return github_failure(exc)
+
+
+@app.post("/api/schedule")
+@protected
+def schedule_create():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return err("Send a JSON body with Content-Type: application/json.", 400)
+    try:
+        item = parse_submission(data)
+        run_at = parse_run_at(data.get("run_at"))
+    except ValueError as exc:
+        return err(str(exc), 400)
+    try:
+        entry = enqueue(item, run_at)
+    except QueueFull:
+        return err(f"You already have {MAX_PENDING} scheduled commits. Publish or cancel some first.", 409)
+    except GitHubError as exc:
+        return github_failure(exc)
+    log.info("scheduled %s for %s", entry["slug"], entry["run_at"])
+    return jsonify(ok=True, item=entry)
+
+
+@app.get("/api/schedule")
+@protected
+def schedule_list():
+    try:
+        return jsonify(ok=True, items=[_public(e) for e in list_queue()])
+    except GitHubError as exc:
+        return github_failure(exc)
+
+
+@app.delete("/api/schedule/<sid>")
+@protected
+def schedule_cancel(sid):
+    if not ID_RE.fullmatch(sid):
+        return err("Invalid id.", 400)
+    try:
+        entry = next((e for e in list_queue() if e["id"] == sid), None)
+        if not entry:
+            return err("That scheduled commit no longer exists.", 404)
+        delete_file(f"{QUEUE_DIR}/{entry['name']}", entry["sha"], f"Cancel: {entry['title']}", QUEUE_BRANCH)
+    except GitHubError as exc:
+        return github_failure(exc)
+    return jsonify(ok=True)
+
+
+@app.post("/api/schedule/<sid>/publish")
+@protected
+def schedule_publish(sid):
+    if not ID_RE.fullmatch(sid):
+        return err("Invalid id.", 400)
+    try:
+        return jsonify(ok=True, **run_due(only_id=sid)["result"])
+    except LookupError:
+        return err("That scheduled commit no longer exists.", 404)
+    except ValueError:
+        return err("That scheduled item was invalid and has been discarded.", 400)
+    except Busy:
+        return err("Another publish is running. Try again in a few seconds.", 409)
+    except GitHubError as exc:
+        return github_failure(exc)
+
+
+@app.post("/api/run-due")
+@protected
+def run_due_route():
+    try:
+        return jsonify(ok=True, **run_due())
+    except Busy:
+        return err("Another publish is running.", 409)
     except GitHubError as exc:
         return github_failure(exc)
 
@@ -874,6 +1128,10 @@ font-size:12px;font-weight:500;color:var(--fg);cursor:pointer}
 .legend{display:flex;align-items:center;justify-content:flex-end;gap:4px;font-size:12px;color:var(--muted);margin-top:8px}
 .legend .cell{display:inline-block}
 #act-msg{color:var(--muted)}
+/* scheduling */
+.sched{margin-top:12px}
+.presets{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.stitle{font-weight:600;word-break:break-word}
 /* toasts */
 #toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:50;width:min(380px,calc(100vw - 32px))}
 .toast{display:flex;gap:10px;align-items:flex-start;background:var(--subtle);border:1px solid var(--border);
@@ -962,6 +1220,23 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       </div>
 
       <div class="field">
+        <div class="toggle">
+          <div><b>Schedule for later</b><span class="d">Save it now and publish to GitHub at a time you choose, e.g. the weekend.</span></div>
+          <label class="switch"><input id="sched" type="checkbox" role="switch" aria-label="Schedule for later"><span class="track"></span></label>
+        </div>
+        <div class="sched" id="sched-panel" hidden>
+          <label for="when">Publish at <span class="opt">(your local time)</span></label>
+          <input id="when" type="datetime-local">
+          <div class="presets">
+            <button type="button" class="btn sm" data-p="sat">Next Saturday 10:00</button>
+            <button type="button" class="btn sm" data-p="sun">Next Sunday 10:00</button>
+            <button type="button" class="btn sm" data-p="tom">Tomorrow 09:00</button>
+          </div>
+          <p class="help" id="when-help"></p>
+        </div>
+      </div>
+
+      <div class="field">
         <label for="code">Solution <span id="code-opt" class="opt" hidden>(optional for manual entries)</span></label>
         <div class="editor">
           <div class="editor-head"><span>solution.py</span><span id="count">0 / {{ max_code }}</span></div>
@@ -979,6 +1254,15 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       <button type="submit" id="go" class="btn primary">Commit changes</button>
     </div>
   </form>
+
+  <section class="box" aria-labelledby="sch-h">
+    <div class="box-header">
+      <span id="sch-h">Scheduled</span> <span class="count" id="scount">0</span><span class="grow"></span>
+      <span class="muted-s">Published automatically by GitHub Actions</span>
+    </div>
+    <ul class="plist" id="slist"></ul>
+    <div class="empty" id="sempty">Enter your app key above to see scheduled commits.</div>
+  </section>
 
   <section class="box" aria-labelledby="stats-h">
     <div class="box-header">
@@ -1060,7 +1344,8 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   const $ = (id) => document.getElementById(id);
   const MAX_CODE = {{ max_code }};
   let problems = [], known = new Set(), lastKey = "", busy = false, unlocked = false, filter = "all", hintTimer,
-      activity = null, activityMsg = "", activityTruncated = false;
+      activity = null, activityMsg = "", activityTruncated = false,
+      scheduled = null, schedMsg = "";
 
   const svg = (inner) => '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + "</svg>";
   const ICONS = {
@@ -1196,7 +1481,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     known = new Set(problems.map((p) => p.slug));
     const dl = $("problems"); dl.replaceChildren();
     problems.forEach((p) => { const o = document.createElement("option"); o.value = p.title; dl.appendChild(o); });
-    renderList(); updateHint(); renderStats();
+    renderList(); updateHint(); renderStats(); renderScheduled();
   }
 
   function upsert(p) {
@@ -1208,7 +1493,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   async function refreshList(announce) {
     const r = await api("/api/problems");
     if (r.networkError || !r.res.ok) {
-      lastKey = ""; unlocked = false; problems = []; activity = null; render(); failToast(r); return false;
+      lastKey = ""; unlocked = false; problems = []; activity = null; scheduled = null; schedMsg = ""; render(); failToast(r); return false;
     }
     unlocked = true; problems = r.data.problems; render();
     if (announce) toast("info", "Unlocked", problems.length + " problem" + (problems.length === 1 ? "" : "s") + " found.");
@@ -1228,7 +1513,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
 
   async function unlockAndLoad(announce) {
     const ok = await refreshList(announce);   // activity only loads after the key is accepted
-    if (ok) await loadActivity();
+    if (ok) await Promise.all([loadActivity(), loadScheduled()]);
     return ok;
   }
 
@@ -1329,20 +1614,135 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     drawHeat(counts);
   }
 
+  /* ---------- scheduling ---------- */
+  const CLOCK = svg('<circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.5 1.5"/>');
+  const fmtWhen = (iso) => new Date(iso).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  function rel(iso) {
+    const ms = new Date(iso).getTime() - Date.now();
+    if (ms <= 0) return "due now";
+    const min = Math.round(ms / 60000);
+    if (min < 60) return "in " + Math.max(min, 1) + " min";
+    const h = Math.round(min / 60);
+    return h < 48 ? "in " + h + " h" : "in " + Math.round(h / 24) + " days";
+  }
+  const toInput = (d) => dayKey(d) + "T" + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  function nextDow(dow, hour) {
+    const n = new Date();
+    const d = new Date(n.getFullYear(), n.getMonth(), n.getDate(), hour, 0);
+    d.setDate(d.getDate() + ((dow - n.getDay() + 7) % 7));
+    if (d <= n) d.setDate(d.getDate() + 7);
+    return d;
+  }
+  function presetDate(p) {
+    if (p === "sat") return nextDow(6, 10);
+    if (p === "sun") return nextDow(0, 10);
+    const n = new Date();
+    return new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1, 9, 0);
+  }
+  function goLabel() { return $("sched").checked ? "Schedule commit" : ($("manual").checked ? "Add manual entry" : "Commit changes"); }
+
+  function updateWhen() {
+    const v = $("when").value, t = v ? new Date(v) : null;
+    $("when-help").textContent = (t && !isNaN(t))
+      ? "Publishes around " + fmtWhen(t.toISOString()) + " (" + rel(t.toISOString()) + ", your local time). It's checked every 15 minutes, so it can land a little later."
+      : "Pick a date and time, or use a shortcut.";
+  }
+  function applySched() {
+    const on = $("sched").checked;
+    $("sched-panel").hidden = !on;
+    if (on) { $("when").min = toInput(new Date()); updateWhen(); }
+    applyManual();
+  }
+
+  async function loadScheduled() {
+    const r = await api("/api/schedule");
+    if (r.networkError || !r.res.ok) {
+      scheduled = null;
+      schedMsg = r.networkError ? "Couldn't load scheduled commits (network error)." : ((r.data && r.data.error) || "Couldn't load scheduled commits.");
+    } else { scheduled = r.data.items || []; schedMsg = ""; }
+    renderScheduled();
+  }
+
+  function srow(s) {
+    const li = el("li", "prow");
+    const dot = el("span", "dot unsolved"); dot.innerHTML = CLOCK;
+    const main = el("div", "pmain");
+    const meta = el("div", "pmeta");
+    meta.append(el("span", "chip", fmtWhen(s.run_at)), el("span", "chip", rel(s.run_at)));
+    main.append(el("span", "stitle", s.title), meta);
+    const pub = el("button", "btn sm", "Publish now"); pub.type = "button";
+    const cancel = el("button", "btn sm", "Cancel"); cancel.type = "button";
+
+    pub.addEventListener("click", async () => {
+      pub.disabled = true; cancel.disabled = true;
+      const r = await api("/api/schedule/" + s.id + "/publish", { method: "POST" });
+      if (r.networkError || !r.res.ok) { pub.disabled = false; cancel.disabled = false; return failToast(r); }
+      const d = r.data;
+      scheduled = (scheduled || []).filter((x) => x.id !== s.id);
+      if (d.status !== "unchanged") bumpActivity();
+      if (d.problem) upsert(d.problem); else render();
+      toast("success", "Published", d.path, d.commit_url);
+      (d.warnings || []).forEach((w) => toast("warning", "Heads up", w));
+    });
+    cancel.addEventListener("click", async () => {
+      if (!window.confirm("Cancel this scheduled commit?")) return;
+      pub.disabled = true; cancel.disabled = true;
+      const r = await api("/api/schedule/" + s.id, { method: "DELETE" });
+      if (r.networkError || !r.res.ok) { pub.disabled = false; cancel.disabled = false; return failToast(r); }
+      scheduled = (scheduled || []).filter((x) => x.id !== s.id);
+      renderScheduled();
+      toast("info", "Cancelled", s.title + " will not be published.");
+    });
+    li.append(dot, main, pub, cancel);
+    return li;
+  }
+
+  function renderScheduled() {
+    const list = $("slist"); list.replaceChildren();
+    const items = scheduled || [];
+    $("scount").textContent = items.length;
+    items.forEach((s) => list.appendChild(srow(s)));
+    $("sempty").hidden = items.length > 0;
+    if (!items.length) {
+      $("sempty").textContent = !unlocked ? "Enter your app key above to see scheduled commits."
+        : scheduled === null ? (schedMsg || "Loading\u2026")
+        : "Nothing scheduled. Turn on \u201cSchedule for later\u201d when committing.";
+    }
+  }
+
+  async function submitScheduled(manual) {
+    const v = $("when").value, t = v ? new Date(v) : null;
+    if (!t || isNaN(t)) { toast("warning", "Pick a time", "Choose when this should be published."); return $("when").focus(); }
+    if (t.getTime() < Date.now() + 60000) { toast("warning", "Pick a later time", "The time must be at least a minute from now."); return $("when").focus(); }
+    setBusy(true, "Scheduling\u2026");
+    try {
+      const r = await api("/api/schedule", { method: "POST", body: JSON.stringify({
+        title: $("title").value, code: $("code").value, difficulty: $("difficulty").value,
+        url: $("url").value, note: $("note").value, solved: $("solved").checked, manual: manual,
+        run_at: t.toISOString().replace(/\.\d{3}Z$/, "Z")
+      })});
+      if (r.networkError || !r.res.ok) return failToast(r);
+      scheduled = (scheduled || []).concat([r.data.item]).sort((a, b) => a.run_at < b.run_at ? -1 : 1);
+      renderScheduled();
+      toast("success", "Scheduled", $("title").value.trim() + " will publish around " + fmtWhen(r.data.item.run_at) + ".");
+      $("note").value = "";
+    } finally { setBusy(false); }
+  }
+
   /* ---------- form ---------- */
   function applyManual() {
     const m = $("manual").checked;
     $("code-opt").hidden = !m;
     $("code").placeholder = m ? "Optional: paste your solution, or leave empty to just log the problem" : "Paste your solution here";
-    if (!busy) $("go").textContent = m ? "Add manual entry" : "Commit changes";
+    if (!busy) $("go").textContent = goLabel();
   }
 
-  function setBusy(on) {
+  function setBusy(on, text) {
     busy = on;
     const go = $("go");
     go.disabled = on;
     go.replaceChildren();
-    if (on) { const s = document.createElement("span"); s.className = "spin"; go.append(s, "Committing\u2026"); }
+    if (on) { const s = document.createElement("span"); s.className = "spin"; go.append(s, text || "Committing\u2026"); }
     else applyManual();
   }
 
@@ -1363,7 +1763,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
 
   $("key").addEventListener("change", () => {
     const k = $("key").value;
-    if (!k) { lastKey = ""; unlocked = false; problems = []; activity = null; render(); return; }
+    if (!k) { lastKey = ""; unlocked = false; problems = []; activity = null; scheduled = null; render(); return; }
     if (k === lastKey) return;
     lastKey = k;
     unlockAndLoad(true);
@@ -1388,6 +1788,8 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     if (!manual && !$("code").value.trim()) { toast("warning", "Nothing to commit", "Paste your solution, or switch on Manual entry."); return $("code").focus(); }
     if ($("code").value.length > MAX_CODE) return toast("error", "Code too long", "Maximum is " + MAX_CODE + " characters.");
 
+    if ($("sched").checked) return submitScheduled(manual);
+
     setBusy(true);
     try {
       const r = await api("/submit", { method: "POST", body: JSON.stringify({
@@ -1406,6 +1808,12 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       $("note").value = "";
     } finally { setBusy(false); }
   });
+
+  $("sched").addEventListener("change", applySched);
+  $("when").addEventListener("input", updateWhen);
+  document.querySelectorAll("#sched-panel [data-p]").forEach((b) => b.addEventListener("click", () => {
+    $("when").value = toInput(presetDate(b.dataset.p)); updateWhen();
+  }));
 
   document.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") $("f").requestSubmit();
