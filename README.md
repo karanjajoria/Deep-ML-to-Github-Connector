@@ -3,6 +3,15 @@
 Commit Deep-ML solutions to GitHub from a GitHub-styled web page or an API call.
 Re-committing the same problem updates its existing file (one file per problem, history in git).
 
+## Two ways to connect
+- **Use my GitHub** (anyone): a visitor pastes their own fine-grained token and repository in the *Connect GitHub* card. No app key needed. Their token is kept only in their browser (optionally for the tab session), is sent to GitHub through the app on each request, and is never stored or logged by the server. Scheduling is not available in this mode.
+- **Owner access** (you): the app key unlocks your own configured repo (`GITHUB_TOKEN`/`GITHUB_REPO`), including scheduling. Your choice of mode is remembered in the browser.
+- Don't want other people using your copy? Set `ALLOW_PERSONAL_TOKENS=0` in Render and only Owner access will work.
+- Visitors are told in the manual to connect only on copies of the app run by someone they trust. Because their token passes through your server in memory to reach GitHub, that trust is real: don't add request logging that records headers.
+
+## User manual
+`/manual` is a public, plain-language guide for end users (create a repo, create a token, connect, every control, notifications, troubleshooting, staying safe). It is linked from the page header and the Connect card.
+
 ## Features
 - **Solved toggle**: mark a problem solved or unsolved when committing, or flip it later from the problem list (makes a small "Mark solved/unsolved" commit).
 - **Manual entry**: log a problem with no code (e.g. one you're still working on). Add the code later by committing the same title again. A manual update never overwrites code you already saved.
@@ -62,4 +71,12 @@ Things to know
 - GitHub pauses scheduled workflows after 60 days without repo activity; your regular commits keep it alive.
 - At most 30 pending items, at most 60 days ahead, at most 5 published per run (extras go out on the next run).
 - Each timer call wakes the Render app, so on the free tier it will stay awake most of the time (free instance hours are shared across your workspace).
-- [Testing schedule feature](solutions/testing_schedule_feature.py) · easy · solved
+
+
+## Email notifications for scheduled publishes
+When the timer publishes something, the workflow opens a GitHub issue assigned to (and mentioning) you, labelled `scheduled-publish`. GitHub emails you about it. Runs where nothing was published create nothing. The issue lists each solution with a link to the file and commit, plus any problems.
+- Check https://github.com/settings/notifications: email should be on for "Participating, @mentions and custom" (the default) and your notification email address should be the one you read.
+- Issues must be enabled on the repo (Settings > General > Features).
+- If the workflow itself fails (wrong key, app down), GitHub emails you its standard failed-workflow notice (Settings > Notifications > Actions > "Failed workflows only").
+- "Publish now" from the web page does not email you, since you're already there.
+- Close or bulk-close the `scheduled-publish` issues whenever you like; they double as a publish log.
