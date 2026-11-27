@@ -21,7 +21,7 @@ from functools import wraps
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, abort, g, jsonify, redirect, render_template_string, request, send_from_directory
+from flask import Flask, abort, g, has_app_context, jsonify, redirect, render_template_string, request, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 logging.basicConfig(level=logging.INFO)
@@ -52,7 +52,7 @@ REPO = _required("GITHUB_REPO")
 APP_KEY = _required("APP_KEY")
 BRANCH = _env("GITHUB_BRANCH", "main")
 
-if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO):
+if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO) or any(set(part) <= {"."} for part in REPO.split("/")):
     raise RuntimeError("GITHUB_REPO must look like 'owner/repo'")
 if not re.fullmatch(r"[A-Za-z0-9._/-]+", BRANCH):
     raise RuntimeError("GITHUB_BRANCH contains unsupported characters")
@@ -68,6 +68,8 @@ GITHUB_URL = _https_url("GITHUB_URL", "https://github.com/karanjajoria")
 REPO_URL = _https_url("REPO_URL", f"https://github.com/{REPO}")
 LINKEDIN_URL = _https_url("LINKEDIN_URL", "https://www.linkedin.com/")
 CREDLY_URL = _https_url("CREDLY_URL", "https://www.credly.com/")
+# Other people may connect with their OWN token + repo (set ALLOW_PERSONAL_TOKENS=0 to turn this off)
+PERSONAL_ALLOWED = _env("ALLOW_PERSONAL_TOKENS", "1") != "0"
 
 MAX_CODE_CHARS = 200_000
 MAX_TITLE_CHARS = 100
@@ -82,16 +84,32 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 # --------------------------------------------------------------------------
 # GitHub API helpers
 # --------------------------------------------------------------------------
-BASE = f"https://api.github.com/repos/{REPO}/contents"
 SESSION = requests.Session()
 SESSION.headers.update(
     {
-        "Authorization": f"Bearer {TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "deepml-sync",
     }
 )
+
+
+OWNER_CFG = {"token": TOKEN, "repo": REPO, "branch": BRANCH}
+
+
+def _cfg():
+    # GitHub target for the current request: the owner's config, or the visitor's own token/repo.
+    if has_app_context():
+        return getattr(g, "gh", None) or OWNER_CFG
+    return OWNER_CFG
+
+
+def _is_owner():
+    return not has_app_context() or getattr(g, "mode", "owner") == "owner"
+
+
+def _auth_headers(cfg):
+    return {"Authorization": f"Bearer {cfg['token']}"}
 
 
 class GitHubError(Exception):
@@ -102,14 +120,16 @@ class GitHubError(Exception):
 
 def _gh(method, path, **kwargs):
     try:
-        return SESSION.request(method, f"{BASE}/{path}", timeout=(5, 20), **kwargs)
+        c = _cfg()
+        return SESSION.request(method, f"https://api.github.com/repos/{c['repo']}/contents/{path}",
+                               headers=_auth_headers(c), timeout=(5, 20), **kwargs)
     except requests.RequestException as exc:
         log.warning("GitHub network error: %s", type(exc).__name__)
         raise GitHubError(0)
 
 
 def get_file(path, branch=None):
-    r = _gh("GET", path, params={"ref": branch or BRANCH})
+    r = _gh("GET", path, params={"ref": branch or _cfg()["branch"]})
     if r.status_code == 404:
         return None, None
     if not r.ok:
@@ -125,7 +145,7 @@ def put_file(path, content, message, sha=None, branch=None):
     body = {
         "message": message,
         "content": base64.b64encode(content.encode("utf-8")).decode(),
-        "branch": branch or BRANCH,
+        "branch": branch or _cfg()["branch"],
     }
     if sha:
         body["sha"] = sha
@@ -137,7 +157,7 @@ def put_file(path, content, message, sha=None, branch=None):
 
 
 def delete_file(path, sha, message, branch=None):
-    r = _gh("DELETE", path, json={"message": message, "sha": sha, "branch": branch or BRANCH})
+    r = _gh("DELETE", path, json={"message": message, "sha": sha, "branch": branch or _cfg()["branch"]})
     if not r.ok:
         log.warning("GitHub DELETE %s -> %s", path, r.status_code)
         raise GitHubError(r.status_code)
@@ -145,7 +165,9 @@ def delete_file(path, sha, message, branch=None):
 
 def _git(method, path, **kwargs):
     try:
-        return SESSION.request(method, f"https://api.github.com/repos/{REPO}/git/{path}", timeout=(5, 20), **kwargs)
+        c = _cfg()
+        return SESSION.request(method, f"https://api.github.com/repos/{c['repo']}/git/{path}",
+                               headers=_auth_headers(c), timeout=(5, 20), **kwargs)
     except requests.RequestException as exc:
         log.warning("GitHub network error: %s", type(exc).__name__)
         raise GitHubError(0)
@@ -153,7 +175,7 @@ def _git(method, path, **kwargs):
 
 def list_solutions():
     """Slugs of every solutions/*.py file."""
-    r = _gh("GET", "solutions", params={"ref": BRANCH})
+    r = _gh("GET", "solutions", params={"ref": _cfg()["branch"]})
     if r.status_code == 404:
         return []
     if not r.ok:
@@ -326,7 +348,7 @@ def problem_record(slug, title, difficulty, solved, manual, url):
         "solved": solved,
         "manual": manual,
         "url": url,
-        "file_url": f"https://github.com/{REPO}/blob/{BRANCH}/solutions/{slug}.py",
+        "file_url": f"https://github.com/{_cfg()['repo']}/blob/{_cfg()['branch']}/solutions/{slug}.py",
     }
 
 
@@ -421,9 +443,11 @@ _activity_cache = {"at": 0.0, "data": None}
 
 def _commit_page(since, page):
     try:
+        c = _cfg()
         r = SESSION.get(
-            f"https://api.github.com/repos/{REPO}/commits",
-            params={"sha": BRANCH, "path": "solutions", "since": since, "per_page": 100, "page": page},
+            f"https://api.github.com/repos/{c['repo']}/commits",
+            params={"sha": c["branch"], "path": "solutions", "since": since, "per_page": 100, "page": page},
+            headers=_auth_headers(c),
             timeout=(5, 20),
         )
     except requests.RequestException as exc:
@@ -445,10 +469,12 @@ def _commit_page(since, page):
 
 def list_activity():
     now = time.time()
-    with _lock:
-        hit = _activity_cache["data"]
-        if hit is not None and now - _activity_cache["at"] < ACTIVITY_TTL:
-            return hit
+    owner = _is_owner()   # the cache only ever serves the owner's own repo, never a visitor's
+    if owner:
+        with _lock:
+            hit = _activity_cache["data"]
+            if hit is not None and now - _activity_cache["at"] < ACTIVITY_TTL:
+                return hit
     since = (datetime.now(timezone.utc) - timedelta(days=ACTIVITY_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     stamps, truncated = [], False
     for page in range(1, ACTIVITY_MAX_PAGES + 1):
@@ -459,12 +485,15 @@ def list_activity():
     else:
         truncated = True
     data = {"timestamps": stamps, "truncated": truncated}
-    with _lock:
-        _activity_cache.update(at=now, data=data)
+    if owner:
+        with _lock:
+            _activity_cache.update(at=now, data=data)
     return data
 
 
 def _bust_activity():
+    if not _is_owner():
+        return
     with _lock:
         _activity_cache["data"] = None
 
@@ -589,7 +618,7 @@ def ensure_queue_branch():
         return
     if r.status_code != 404:
         raise GitHubError(r.status_code)
-    base = _git("GET", f"ref/heads/{BRANCH}")
+    base = _git("GET", f"ref/heads/{_cfg()['branch']}")
     if not base.ok:
         raise GitHubError(base.status_code)
     c = _git("POST", "refs", json={"ref": f"refs/heads/{QUEUE_BRANCH}", "sha": base.json()["object"]["sha"]})
@@ -712,36 +741,72 @@ def err(message, status=400, **extra):
     return jsonify(ok=False, error=message, **extra), status
 
 
-def protected(view):
-    @wraps(view)
-    def wrapper(*args, **kwargs):
-        # Browsers send Origin on cross-site requests; refuse anything not same-origin.
-        origin = request.headers.get("Origin")
-        if origin and urlparse(origin).netloc != request.host:
-            return err("Cross-origin requests are not allowed.", 403)
+TOKEN_RE = re.compile(r"(github_pat_[A-Za-z0-9_]{20,255}|gh[pousr]_[A-Za-z0-9]{20,255})")
+PERSONAL_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}")
+BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,100}")
 
-        ip = request.remote_addr or "unknown"
-        now = time.time()
-        with _lock:
-            fails = _prune(_fails, ip, FAIL_WINDOW, now)
-            if len(fails) >= FAIL_LIMIT:
-                wait = int(FAIL_WINDOW - (now - fails[0])) + 1
-                return err(f"Too many failed attempts. Try again in {-(-wait // 60)} min.", 429, retry_after=wait)
-            hits = _prune(_hits, ip, REQ_WINDOW, now)
-            if len(hits) >= REQ_LIMIT:
-                return err("Too many requests. Slow down for a minute.", 429, retry_after=REQ_WINDOW)
-            hits.append(now)
 
-        supplied = request.headers.get("X-API-Key", "")
-        digest = hashlib.sha256(supplied.encode()).digest()
-        if not hmac.compare_digest(digest, APP_KEY_HASH):  # constant-time
+def personal_cfg():
+    token = request.headers.get("X-GitHub-Token", "").strip()
+    repo = request.headers.get("X-GitHub-Repo", "").strip()
+    branch = request.headers.get("X-GitHub-Branch", "").strip() or "main"
+    if not TOKEN_RE.fullmatch(token):
+        raise ValueError("That doesn't look like a GitHub token. It should start with github_pat_ (or ghp_).")
+    if not PERSONAL_REPO_RE.fullmatch(repo):
+        raise ValueError("Enter the repository as owner/repo-name, for example yourname/deep-ml-solutions.")
+    if not BRANCH_RE.fullmatch(branch):
+        raise ValueError("Invalid branch name.")
+    return {"token": token, "repo": repo, "branch": branch}
+
+
+def protected(view=None, owner_only=False):
+    def decorate(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            # Browsers send Origin on cross-site requests; refuse anything not same-origin.
+            origin = request.headers.get("Origin")
+            if origin and urlparse(origin).netloc != request.host:
+                return err("Cross-origin requests are not allowed.", 403)
+
+            ip = request.remote_addr or "unknown"
+            now = time.time()
+            personal = bool(request.headers.get("X-GitHub-Token"))
             with _lock:
-                _fails[ip].append(now)
-            log.warning("auth failure from %s", ip)
-            return err("Invalid app key.", 401)
-        return view(*args, **kwargs)
+                if not personal:   # wrong-key lockout only applies to owner access
+                    fails = _prune(_fails, ip, FAIL_WINDOW, now)
+                    if len(fails) >= FAIL_LIMIT:
+                        wait = int(FAIL_WINDOW - (now - fails[0])) + 1
+                        return err(f"Too many failed attempts. Try again in {-(-wait // 60)} min.", 429, retry_after=wait)
+                hits = _prune(_hits, ip, REQ_WINDOW, now)
+                if len(hits) >= REQ_LIMIT:
+                    return err("Too many requests. Slow down for a minute.", 429, retry_after=REQ_WINDOW)
+                hits.append(now)
 
-    return wrapper
+            if personal:
+                if not PERSONAL_ALLOWED:
+                    return err("Connecting your own GitHub is turned off on this server.", 403)
+                if owner_only:
+                    return err("This feature is only available with owner access.", 403)
+                try:
+                    g.gh = personal_cfg()
+                except ValueError as exc:
+                    return err(str(exc), 400)
+                g.mode = "personal"
+                return fn(*args, **kwargs)
+
+            supplied = request.headers.get("X-API-Key", "")
+            digest = hashlib.sha256(supplied.encode()).digest()
+            if not hmac.compare_digest(digest, APP_KEY_HASH):  # constant-time
+                with _lock:
+                    _fails[ip].append(now)
+                log.warning("auth failure from %s", ip)
+                return err("Invalid app key.", 401)
+            g.gh, g.mode = OWNER_CFG, "owner"
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate(view) if view else decorate
 
 
 @app.before_request
@@ -817,6 +882,7 @@ def github_failure(exc):
 def home():
     return render_template_string(
         PAGE,
+        css=CSS,
         nonce=g.nonce,
         year=date.today().year,
         github_url=GITHUB_URL,
@@ -825,6 +891,60 @@ def home():
         credly_url=CREDLY_URL,
         max_code=MAX_CODE_CHARS,
     )
+
+
+@app.get("/manual")
+def manual():
+    return render_template_string(MANUAL, css=CSS, nonce=g.nonce, year=date.today().year, github_url=GITHUB_URL,
+                                  linkedin_url=LINKEDIN_URL, credly_url=CREDLY_URL)
+
+
+@app.post("/api/connect")
+@protected
+def connect():
+    if g.mode != "personal":
+        return err("Connecting is only needed when using your own GitHub token.", 400)
+    cfg = g.gh
+    try:
+        r = SESSION.get(f"https://api.github.com/repos/{cfg['repo']}", headers=_auth_headers(cfg), timeout=(5, 20))
+    except requests.RequestException:
+        return err("Couldn't reach GitHub. Try again in a moment.", 502)
+    if r.status_code == 401:
+        return err("GitHub rejected this token. Check you copied all of it and that it hasn't expired.", 401)
+    if r.status_code == 403:
+        return err("GitHub denied access. Check the token's permissions, or try again in a few minutes.", 403)
+    if r.status_code == 404:
+        return err("Repository not found, or this token can't see it. Check the name (owner/repo) and that you "
+                   "selected this repository when creating the token.", 404)
+    if not r.ok:
+        return err("GitHub returned an error. Try again.", 502)
+    data = r.json()
+    if data.get("archived"):
+        return err("This repository is archived (read-only). Choose another repository.", 400)
+    perms = data.get("permissions")
+    if isinstance(perms, dict) and not perms.get("push"):
+        return err("This token can only read the repository. Give it Contents: Read and write.", 403)
+    branch = data.get("default_branch") or "main"
+    if not BRANCH_RE.fullmatch(branch):
+        return err("The repository's default branch name isn't supported.", 400)
+    login = ""
+    try:
+        u = SESSION.get("https://api.github.com/user", headers=_auth_headers(cfg), timeout=(5, 15))
+        if u.ok:
+            login = u.json().get("login", "")
+    except requests.RequestException:
+        pass
+    login = login or (data.get("owner") or {}).get("login", "")
+    warnings = []
+    if data.get("fork"):
+        warnings.append("This repository is a fork, so commits made here won't count on your GitHub profile. "
+                        "Use a repository you created from scratch.")
+    if data.get("private"):
+        warnings.append("This repository is private. To show its activity on your profile, turn on "
+                        "'Private contributions' in your profile's contribution settings.")
+    log.info("personal connect ok")
+    return jsonify(ok=True, login=login, repo=data.get("full_name") or cfg["repo"], branch=branch,
+                   private=bool(data.get("private")), warnings=warnings)
 
 
 @app.post("/submit")
@@ -874,7 +994,7 @@ def problems():
 
 
 @app.post("/api/schedule")
-@protected
+@protected(owner_only=True)
 def schedule_create():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
@@ -895,7 +1015,7 @@ def schedule_create():
 
 
 @app.get("/api/schedule")
-@protected
+@protected(owner_only=True)
 def schedule_list():
     try:
         return jsonify(ok=True, items=[_public(e) for e in list_queue()])
@@ -904,7 +1024,7 @@ def schedule_list():
 
 
 @app.delete("/api/schedule/<sid>")
-@protected
+@protected(owner_only=True)
 def schedule_cancel(sid):
     if not ID_RE.fullmatch(sid):
         return err("Invalid id.", 400)
@@ -919,7 +1039,7 @@ def schedule_cancel(sid):
 
 
 @app.post("/api/schedule/<sid>/publish")
-@protected
+@protected(owner_only=True)
 def schedule_publish(sid):
     if not ID_RE.fullmatch(sid):
         return err("Invalid id.", 400)
@@ -936,7 +1056,7 @@ def schedule_publish(sid):
 
 
 @app.post("/api/run-due")
-@protected
+@protected(owner_only=True)
 def run_due_route():
     try:
         return jsonify(ok=True, **run_due())
@@ -992,16 +1112,7 @@ def google_verification(name):
 # --------------------------------------------------------------------------
 # UI (GitHub "Primer"-style, dark/light follows the system theme)
 # --------------------------------------------------------------------------
-PAGE = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
-<meta name="robots" content="noindex, nofollow">
-<title>Deep-ML Sync</title>
-<link rel="icon" href="data:,">
-<style nonce="{{ nonce }}">
+CSS = r"""
 :root{--bg:#0d1117;--subtle:#161b22;--inset:#010409;--border:#30363d;--fg:#e6edf3;--muted:#8b949e;
 --accent:#4493f8;--green:#238636;--green-h:#2ea043;--red:#f85149;--amber:#d29922;--blue:#1f6feb;
 --btn:#21262d;--btn-h:#30363d;--shadow:0 8px 24px rgba(1,4,9,.6);
@@ -1132,6 +1243,36 @@ font-size:12px;font-weight:500;color:var(--fg);cursor:pointer}
 .sched{margin-top:12px}
 .presets{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 .stitle{font-weight:600;word-break:break-word}
+/* connect card + manual */
+.topbar .grow{flex:1}
+.nav{color:var(--muted);font-size:14px}.nav:hover{color:var(--accent);text-decoration:none}
+.seg.block{display:flex;margin-bottom:16px}
+.seg.block button{flex:1;padding:6px 12px;font-size:13px}
+.check{display:flex;align-items:center;gap:8px;font-weight:400;margin:0 0 12px}
+.check input{width:auto;min-height:0}
+.flash.ok{border-color:var(--green-h);background:rgba(46,160,67,.12);margin-top:0;align-items:center}
+.flash.ok svg{stroke:var(--green-h)}
+.flash.ok span{flex:1}
+.doc{line-height:1.6}
+.doc h1{font-size:28px;font-weight:600;border-bottom:1px solid var(--border);padding-bottom:8px;margin:0 0 12px}
+.doc h2{font-size:20px;font-weight:600;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border);scroll-margin-top:16px}
+.doc h3{font-size:16px;font-weight:600;margin:20px 0 8px}
+.doc p,.doc li{margin:0 0 10px}
+.doc ol,.doc ul{padding-left:24px;margin:0 0 12px}
+.doc table{width:100%;border-collapse:collapse;margin:8px 0 16px;font-size:13px}
+.doc th,.doc td{border:1px solid var(--border);padding:6px 12px;text-align:left;vertical-align:top}
+.doc th{background:var(--subtle)}
+.toc{border:1px solid var(--border);border-radius:6px;background:var(--subtle);padding:12px 16px;margin:16px 0 8px}
+.toc ol{columns:2;column-gap:32px;margin:6px 0 0}
+@media (max-width:600px){.toc ol{columns:1}}
+.callout{border:1px solid var(--blue);background:rgba(31,111,235,.1);border-radius:6px;padding:10px 14px;margin:12px 0}
+.callout.warn{border-color:var(--amber);background:rgba(210,153,34,.12)}
+.callout.safe{border-color:var(--green-h);background:rgba(46,160,67,.12)}
+.callout p:last-child{margin:0}
+kbd{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;padding:1px 6px;background:var(--subtle)}
+.pill{display:inline-block;border-radius:2em;padding:0 8px;font-size:12px;line-height:18px;font-weight:600;border:1px solid var(--border)}
+.pill.g{color:var(--green-h);border-color:var(--green-h)}.pill.b{color:var(--accent);border-color:var(--accent)}
+.pill.y{color:var(--amber);border-color:var(--amber)}.pill.r{color:var(--red);border-color:var(--red)}
 /* toasts */
 #toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:50;width:min(380px,calc(100vw - 32px))}
 .toast{display:flex;gap:10px;align-items:flex-start;background:var(--subtle);border:1px solid var(--border);
@@ -1161,7 +1302,18 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
 .f-bottom{max-width:800px;margin:0 auto;padding:12px 16px 24px;color:var(--muted);font-size:12px;border-top:1px solid var(--border)}
 .badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .badge{border:1px solid var(--border);border-radius:2em;padding:0 8px;font-size:12px;color:var(--muted);line-height:18px}
-</style>
+"""
+
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex, nofollow">
+<title>Deep-ML Sync</title>
+<link rel="icon" href="data:,">
+<style nonce="{{ nonce }}">{{ css|safe }}</style>
 </head>
 <body>
 <header class="topbar">
@@ -1169,11 +1321,57 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>
   </a>
   <a class="crumb" href="{{ repo_url }}" target="_blank" rel="noopener noreferrer" title="Open the solutions repository">Deep-ML <span>/</span> <b>Sync</b></a>
+  <span class="grow"></span>
+  <a class="nav" href="/manual" target="_blank" rel="noopener">User manual</a>
 </header>
 
 <main>
   <h1>Commit a solution</h1>
   <p class="lead">Push your Deep-ML solution to GitHub. Committing the same problem again updates its existing file instead of creating a copy.</p>
+
+  <section class="box" id="conn-box" aria-labelledby="conn-h">
+    <div class="box-header">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 7V5a4 4 0 1 1 8 0v2h.5A1.5 1.5 0 0 1 14 8.5v5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 13.5v-5A1.5 1.5 0 0 1 3.5 7H4Zm1.5 0h5V5a2.5 2.5 0 0 0-5 0v2Z"/></svg>
+      <span id="conn-h">Connect GitHub</span><span class="grow"></span>
+      <a href="/manual" target="_blank" rel="noopener">User manual</a>
+    </div>
+    <div class="box-body">
+      <div class="seg block" id="mode-seg" role="group" aria-label="How do you want to connect?">
+        <button type="button" data-m="personal" aria-pressed="true">Use my GitHub</button>
+        <button type="button" data-m="owner" aria-pressed="false">Owner access</button>
+      </div>
+
+      <div id="pane-personal">
+        <div id="conn-form">
+          <div class="field">
+            <label for="gh-token">Personal access token</label>
+            <input id="gh-token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_...">
+            <p class="help">Needs <b>Contents: Read and write</b> on your repository. <a href="/manual#token" target="_blank" rel="noopener">How to create one</a>.</p>
+          </div>
+          <div class="field">
+            <label for="gh-repo">Repository</label>
+            <input id="gh-repo" autocomplete="off" spellcheck="false" placeholder="your-username/deep-ml-solutions">
+            <p class="help">Where your solutions will be saved. Pasting the full GitHub link works too.</p>
+          </div>
+          <label class="check"><input id="remember" type="checkbox"> Keep me connected until I close this tab <span class="opt">(not on shared computers)</span></label>
+          <button type="button" id="connect" class="btn primary">Connect</button>
+        </div>
+        <div id="conn-ok" class="flash ok" hidden>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.5"/><path d="M5.2 8.2l2 2 3.6-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span id="conn-text"></span>
+          <button type="button" id="disconnect" class="btn sm">Disconnect</button>
+        </div>
+      </div>
+
+      <div id="pane-owner" hidden>
+        <div class="field">
+          <label for="key">App key</label>
+          <input id="key" type="password" autocomplete="current-password" spellcheck="false">
+          <p class="help">For the person who runs this app. Sent over HTTPS in a request header and never stored in the browser.</p>
+        </div>
+      </div>
+    </div>
+  </section>
 
   <form id="f" class="box" autocomplete="off" novalidate>
     <div class="box-header">
@@ -1181,12 +1379,6 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       New commit
     </div>
     <div class="box-body">
-      <div class="field">
-        <label for="key">App key</label>
-        <input id="key" type="password" autocomplete="current-password" spellcheck="false" required>
-        <p class="help">Sent over HTTPS in a request header. Never stored in the browser.</p>
-      </div>
-
       <div class="field">
         <label for="title">Problem title</label>
         <input id="title" list="problems" placeholder="e.g. Single Neuron" maxlength="100" required>
@@ -1219,7 +1411,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
         </div>
       </div>
 
-      <div class="field">
+      <div class="field owner-only">
         <div class="toggle">
           <div><b>Schedule for later</b><span class="d">Save it now and publish to GitHub at a time you choose, e.g. the weekend.</span></div>
           <label class="switch"><input id="sched" type="checkbox" role="switch" aria-label="Schedule for later"><span class="track"></span></label>
@@ -1255,13 +1447,13 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     </div>
   </form>
 
-  <section class="box" aria-labelledby="sch-h">
+  <section class="box owner-only" aria-labelledby="sch-h">
     <div class="box-header">
       <span id="sch-h">Scheduled</span> <span class="count" id="scount">0</span><span class="grow"></span>
       <span class="muted-s">Published automatically by GitHub Actions</span>
     </div>
     <ul class="plist" id="slist"></ul>
-    <div class="empty" id="sempty">Enter your app key above to see scheduled commits.</div>
+    <div class="empty" id="sempty">Connect GitHub (Owner access) above to see scheduled commits.</div>
   </section>
 
   <section class="box" aria-labelledby="stats-h">
@@ -1270,7 +1462,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       <span class="muted-s">From your saved problems and commit history</span>
     </div>
     <div class="box-body">
-      <div class="empty" id="stats-empty">Enter your app key above to see your stats.</div>
+      <div class="empty" id="stats-empty">Connect GitHub above to see your stats.</div>
       <div id="stats-content" hidden>
         <div class="stats" id="stat-cards"></div>
         <h3 class="sub">By difficulty</h3>
@@ -1298,7 +1490,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
       <button type="button" id="refresh" class="btn sm">Refresh</button>
     </div>
     <ul class="plist" id="plist"></ul>
-    <div class="empty" id="empty">Enter your app key above to load your problems.</div>
+    <div class="empty" id="empty">Connect GitHub above to load your problems.</div>
   </section>
 </main>
 
@@ -1309,10 +1501,10 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>
         Deep-ML Sync
       </div>
-      <p>Commit your Deep-ML solutions to GitHub so your practice shows up on your contribution graph. Each problem keeps a single file, and every re-commit is a new version in its history.</p>
+      <p>Commit your Deep-ML solutions to GitHub so your practice shows up on your contribution graph. Each problem keeps a single file, and every re-commit is a new version in its history. New here? Read the <a href="/manual">user manual</a>.</p>
       <div class="badges">
         <span class="badge">HTTPS only</span><span class="badge">No cookies</span>
-        <span class="badge">Code is never stored on this server</span><span class="badge">Rate limited</span>
+        <span class="badge">Code is never stored on this server</span><span class="badge">Rate limited</span><span class="badge">Your token is never stored on the server</span>
       </div>
     </div>
     <div>
@@ -1345,7 +1537,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   const MAX_CODE = {{ max_code }};
   let problems = [], known = new Set(), lastKey = "", busy = false, unlocked = false, filter = "all", hintTimer,
       activity = null, activityMsg = "", activityTruncated = false,
-      scheduled = null, schedMsg = "";
+      scheduled = null, schedMsg = "", mode = "personal", conn = null;
 
   const svg = (inner) => '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + "</svg>";
   const ICONS = {
@@ -1382,7 +1574,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
 
   async function api(path, options) {
     options = options || {};
-    const headers = { "X-API-Key": $("key").value };
+    const headers = authHeaders();
     if (options.body) headers["Content-Type"] = "application/json";
     let res;
     try {
@@ -1396,8 +1588,10 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   function failToast(r) {
     if (r.networkError) return toast("error", "Network error", "Couldn't reach the server. Check your connection and try again.");
     const s = r.res.status, m = r.data && r.data.error;
-    if (s === 401) return toast("error", "Invalid app key", "The key doesn't match. Check it and try again.");
+    if (s === 401) return mode === "owner" ? toast("error", "Invalid app key", "The key doesn't match. Check it and try again.")
+      : toast("error", "Token rejected", m || "GitHub rejected this token.");
     if (s === 429) return toast("warning", "Slow down", m || "Too many attempts. Please wait.");
+    if (s === 502 && mode === "personal" && /rejected the token/i.test(m || "")) return toast("error", "Token expired or revoked", "Disconnect, then connect again with a new token.");
     if (s === 502) return toast("error", "GitHub problem", m || "GitHub rejected the request.");
     if (s === 404) return toast("warning", "Not found", m || "Nothing found.");
     toast("error", "Couldn't complete that", m || ("Unexpected error (" + s + ")."));
@@ -1465,7 +1659,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     shown.forEach((p) => list.appendChild(row(p)));
     $("empty").hidden = shown.length > 0;
     if (!shown.length) {
-      $("empty").textContent = !unlocked ? "Enter your app key above to load your problems."
+      $("empty").textContent = !unlocked ? "Connect GitHub above to load your problems."
         : problems.length ? "No problems match this filter." : "No problems yet. Commit your first solution above.";
     }
   }
@@ -1639,7 +1833,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     const n = new Date();
     return new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1, 9, 0);
   }
-  function goLabel() { return $("sched").checked ? "Schedule commit" : ($("manual").checked ? "Add manual entry" : "Commit changes"); }
+  function goLabel() { return (mode === "owner" && $("sched").checked) ? "Schedule commit" : ($("manual").checked ? "Add manual entry" : "Commit changes"); }
 
   function updateWhen() {
     const v = $("when").value, t = v ? new Date(v) : null;
@@ -1655,6 +1849,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   }
 
   async function loadScheduled() {
+    if (mode !== "owner") { scheduled = []; schedMsg = ""; renderScheduled(); return; }   // owner-only feature
     const r = await api("/api/schedule");
     if (r.networkError || !r.res.ok) {
       scheduled = null;
@@ -1704,7 +1899,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     items.forEach((s) => list.appendChild(srow(s)));
     $("sempty").hidden = items.length > 0;
     if (!items.length) {
-      $("sempty").textContent = !unlocked ? "Enter your app key above to see scheduled commits."
+      $("sempty").textContent = !unlocked ? "Connect GitHub (Owner access) above to see scheduled commits."
         : scheduled === null ? (schedMsg || "Loading\u2026")
         : "Nothing scheduled. Turn on \u201cSchedule for later\u201d when committing.";
     }
@@ -1761,6 +1956,79 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     toast("info", "Loaded", d.manual ? "Manual entry loaded. Add your code whenever you're ready." : "Current code is in the editor.");
   }
 
+  /* ---------- connection ---------- */
+  const SS = {
+    get() { try { return sessionStorage.getItem("dmlconn"); } catch (e) { return null; } },
+    set(v) { try { sessionStorage.setItem("dmlconn", v); } catch (e) {} },
+    del() { try { sessionStorage.removeItem("dmlconn"); } catch (e) {} }
+  };
+  function authHeaders() {
+    if (mode === "owner") return { "X-API-Key": $("key").value };
+    if (conn) return { "X-GitHub-Token": conn.token, "X-GitHub-Repo": conn.repo, "X-GitHub-Branch": conn.branch };
+    return {};
+  }
+  const hasAuth = () => (mode === "owner" ? !!$("key").value : !!conn);
+  function needAuth() {
+    if (mode === "owner") { toast("warning", "App key needed", "Enter your app key first."); $("key").focus(); }
+    else { toast("warning", "Connect GitHub first", "Add your token and repository in the Connect GitHub card."); $("gh-token").focus(); }
+  }
+  function parseRepo(v) {
+    v = (v || "").trim();
+    const m = v.match(/^https?:\/\/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/i) || v.match(/^([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/);
+    return m ? m[1] + "/" + m[2] : null;
+  }
+  function renderConn() {
+    const on = !!conn;
+    $("conn-form").hidden = on; $("conn-ok").hidden = !on;
+    if (on) $("conn-text").textContent = "Connected as @" + conn.login + " \u00b7 " + conn.repo + " (branch " + conn.branch + ")";
+  }
+  function resetData() {
+    lastKey = ""; unlocked = false; problems = []; activity = null; scheduled = null; schedMsg = "";
+  }
+  function setMode(m) {
+    mode = m;
+    try { localStorage.setItem("dmlmode", m); } catch (e) {}
+    $("pane-personal").hidden = m !== "personal"; $("pane-owner").hidden = m !== "owner";
+    document.querySelectorAll("#mode-seg button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.m === m)));
+    document.querySelectorAll(".owner-only").forEach((e) => { e.hidden = m !== "owner"; });
+    if (m !== "owner") { $("sched").checked = false; applySched(); }
+    resetData(); render();
+    if (hasAuth()) { if (m === "owner") lastKey = $("key").value; unlockAndLoad(false); }
+  }
+  async function connect() {
+    const token = $("gh-token").value.trim(), repo = parseRepo($("gh-repo").value);
+    if (!token) { toast("warning", "Token needed", "Paste your personal access token."); return $("gh-token").focus(); }
+    if (!repo) { toast("warning", "Repository needed", "Enter it as your-username/repo-name."); return $("gh-repo").focus(); }
+    const btn = $("connect"); btn.disabled = true; btn.textContent = "Connecting\u2026";
+    let res, data = {};
+    try {
+      res = await fetch("/api/connect", { method: "POST", headers: { "X-GitHub-Token": token, "X-GitHub-Repo": repo }, cache: "no-store", credentials: "omit" });
+      try { data = await res.json(); } catch (e) {}
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "Connect";
+      return toast("error", "Network error", "Couldn't reach the server. Check your connection and try again.");
+    }
+    btn.disabled = false; btn.textContent = "Connect";
+    if (!res.ok) return toast("error", "Couldn't connect", data.error || ("Unexpected error (" + res.status + ")."));
+    conn = { token: token, repo: data.repo, branch: data.branch, login: data.login };
+    if ($("remember").checked) SS.set(JSON.stringify(conn));
+    $("gh-token").value = "";   // the field is emptied; the token is now held only in this page
+    renderConn();
+    toast("success", "Connected", "Signed in as @" + data.login + ". Solutions will be saved to " + data.repo + ".");
+    (data.warnings || []).forEach((w) => toast("warning", "Heads up", w));
+    await unlockAndLoad(false);
+  }
+  function disconnect() {
+    conn = null; SS.del(); $("remember").checked = false;
+    resetData(); renderConn(); render();
+    toast("info", "Disconnected", "Your token was removed from this page.");
+  }
+  $("connect").addEventListener("click", connect);
+  $("disconnect").addEventListener("click", disconnect);
+  ["gh-token", "gh-repo"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); connect(); } }));
+  $("remember").addEventListener("change", () => { if (!conn) return; if ($("remember").checked) SS.set(JSON.stringify(conn)); else SS.del(); });
+  document.querySelectorAll("#mode-seg button").forEach((b) => b.addEventListener("click", () => { if (b.dataset.m !== mode) setMode(b.dataset.m); }));
+
   $("key").addEventListener("change", () => {
     const k = $("key").value;
     if (!k) { lastKey = ""; unlocked = false; problems = []; activity = null; scheduled = null; render(); return; }
@@ -1773,7 +2041,7 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
   $("manual").addEventListener("change", applyManual);
   $("load").addEventListener("click", () => loadInto(slugify($("title").value)));
   $("refresh").addEventListener("click", async () => {
-    if (!$("key").value) return toast("warning", "App key needed", "Enter your app key first.");
+    if (!hasAuth()) return needAuth();
     const ok = await unlockAndLoad(false);
     if (ok) toast("info", "Refreshed", problems.length + " problem" + (problems.length === 1 ? "" : "s") + " loaded.");
   });
@@ -1783,12 +2051,12 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     e.preventDefault();
     if (busy) return;
     const manual = $("manual").checked;
-    if (!$("key").value) { toast("warning", "App key needed", "Enter your app key first."); return $("key").focus(); }
+    if (!hasAuth()) return needAuth();
     if (!$("title").value.trim()) { toast("warning", "Title needed", "Enter the problem title."); return $("title").focus(); }
     if (!manual && !$("code").value.trim()) { toast("warning", "Nothing to commit", "Paste your solution, or switch on Manual entry."); return $("code").focus(); }
     if ($("code").value.length > MAX_CODE) return toast("error", "Code too long", "Maximum is " + MAX_CODE + " characters.");
 
-    if ($("sched").checked) return submitScheduled(manual);
+    if (mode === "owner" && $("sched").checked) return submitScheduled(manual);
 
     setBusy(true);
     try {
@@ -1819,9 +2087,270 @@ footer h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") $("f").requestSubmit();
   });
 
-  render();
+  (function init() {
+    let m = "personal";
+    try { if (localStorage.getItem("dmlmode") === "owner") m = "owner"; } catch (e) {}
+    const saved = SS.get();
+    if (saved) {
+      try {
+        const c = JSON.parse(saved);
+        if (c && c.token && c.repo && c.branch && c.login) { conn = c; $("remember").checked = true; }
+      } catch (e) {}
+    }
+    renderConn(); setMode(m);
+  })();
 })();
 </script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------
+# User manual page (public). Plain how-to guide: no technical internals.
+# --------------------------------------------------------------------------
+MANUAL = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>User manual - Deep-ML Sync</title>
+<link rel="icon" href="data:,">
+<style nonce="{{ nonce }}">{{ css|safe }}</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="logo" href="{{ github_url }}" target="_blank" rel="noopener noreferrer" aria-label="GitHub profile" title="GitHub profile">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>
+  </a>
+  <a class="crumb" href="/" title="Back to the app">Deep-ML <span>/</span> <b>Sync</b></a>
+  <span class="grow"></span>
+  <a class="nav" href="/">Open the app</a>
+</header>
+
+<main class="doc">
+<h1>User manual</h1>
+<p>Deep-ML Sync saves your Deep-ML solutions to a GitHub repository that you own, so your practice shows up on your GitHub profile. This guide takes you from nothing to your first saved solution, then explains every part of the app.</p>
+
+<nav class="toc" aria-label="Contents">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#start">Get started in 4 steps</a></li>
+    <li><a href="#repo">Create a repository</a></li>
+    <li><a href="#token">Create your personal access token</a></li>
+    <li><a href="#connect">Connect your GitHub</a></li>
+    <li><a href="#commit">Commit a solution</a></li>
+    <li><a href="#update">Update a solution later</a></li>
+    <li><a href="#status">Solved switch and manual entries</a></li>
+    <li><a href="#problems">Your problems</a></li>
+    <li><a href="#stats">Stats</a></li>
+    <li><a href="#schedule">Schedule a commit (owner access)</a></li>
+    <li><a href="#messages">Notifications and what they mean</a></li>
+    <li><a href="#keys">Keyboard shortcuts</a></li>
+    <li><a href="#profile">Make commits show on your profile</a></li>
+    <li><a href="#trouble">Troubleshooting</a></li>
+    <li><a href="#safe">Staying safe</a></li>
+    <li><a href="#faq">Questions and answers</a></li>
+  </ol>
+</nav>
+
+<h2 id="start">1. Get started in 4 steps</h2>
+<ol>
+  <li><a href="#repo">Create a repository</a> on GitHub to hold your solutions (2 minutes).</li>
+  <li><a href="#token">Create a personal access token</a> that lets the app save files to that repository (3 minutes).</li>
+  <li><a href="#connect">Connect</a>: paste the token and repository name into the <b>Connect GitHub</b> card.</li>
+  <li><a href="#commit">Commit your first solution</a>.</li>
+</ol>
+<p>You only need to do steps 1 and 2 once. You will need a free GitHub account with a verified email address.</p>
+
+<h2 id="repo">2. Create a repository</h2>
+<ol>
+  <li>Sign in to GitHub. Click the <b>+</b> at the top right, then <b>New repository</b>.</li>
+  <li>Name it, for example <code>deep-ml-solutions</code>.</li>
+  <li>Choose <b>Public</b> (anyone can see your solutions) or <b>Private</b> (only you can).</li>
+  <li>Tick <b>Add a README file</b>.</li>
+  <li>Click <b>Create repository</b>.</li>
+</ol>
+<div class="callout warn"><p><b>Don't fork someone else's repository.</b> Activity in a fork doesn't count on your GitHub profile. Always create a new repository of your own.</p></div>
+
+<h2 id="token">3. Create your personal access token</h2>
+<p>A personal access token works like a password that only allows the app to save files to the repository you choose.</p>
+<ol>
+  <li>On GitHub, click your profile picture, then <b>Settings</b>.</li>
+  <li>Scroll to the bottom of the left menu and click <b>Developer settings</b>.</li>
+  <li>Click <b>Personal access tokens</b>, then <b>Fine-grained tokens</b>, then <b>Generate new token</b>.</li>
+  <li><b>Token name:</b> <code>deepml-sync</code>.</li>
+  <li><b>Expiration:</b> choose 90 days or 1 year. When it runs out, create a new token and connect again.</li>
+  <li><b>Repository access:</b> choose <b>Only select repositories</b> and pick the repository you created.</li>
+  <li><b>Permissions:</b> open <b>Repository permissions</b>, find <b>Contents</b> and set it to <b>Read and write</b>. Leave everything else alone. You don't need any Account permissions.</li>
+  <li>Click <b>Generate token</b> and copy it straight away. It starts with <code>github_pat_</code>. GitHub shows it only once.</li>
+</ol>
+<div class="callout safe"><p><b>Tip:</b> keep the token in a password manager. Treat it like a password and never post it anywhere.</p></div>
+<p>An older-style "classic" token also works if it has the <b>repo</b> permission, but a fine-grained token is safer because it only reaches the one repository you choose.</p>
+
+<h2 id="connect">4. Connect your GitHub</h2>
+<ol>
+  <li>Open the app. In the <b>Connect GitHub</b> card, make sure <b>Use my GitHub</b> is selected.</li>
+  <li>Paste your token into <b>Personal access token</b>.</li>
+  <li>In <b>Repository</b>, type <code>your-username/deep-ml-solutions</code> (your own username and repository name). Pasting the repository's full GitHub link also works.</li>
+  <li>Optional: tick <b>Keep me connected until I close this tab</b> if you don't want to paste your token again after refreshing the page. Leave it unticked on shared computers.</li>
+  <li>Click <b>Connect</b>.</li>
+</ol>
+<p>When it works, a green box says <i>Connected as @yourname</i> with your repository, and the <b>Your problems</b> and <b>Stats</b> sections fill in. The token box is emptied for safety.</p>
+<p><b>To disconnect</b>, click <b>Disconnect</b>. Do this when you finish on a shared computer. To use a different repository, disconnect and connect again.</p>
+<p>If you refresh the page without ticking <b>Keep me connected</b>, you will need to connect again.</p>
+<div class="callout"><p><b>Owner access</b> is only for the person who runs the app and uses an app key. If you are a regular user, ignore it and use <b>Use my GitHub</b>.</p></div>
+
+<h2 id="commit">5. Commit a solution</h2>
+<p>Fill in the <b>New commit</b> box and click <b>Commit changes</b>.</p>
+<table>
+  <tr><th>Field</th><th>What to enter</th></tr>
+  <tr><td><b>Problem title</b></td><td>The problem's name on Deep-ML, e.g. <code>Single Neuron</code>. Required, up to 100 characters. Letters, numbers, spaces and <code>- . , : &amp; ' + / ( ) # ? !</code> are allowed. As you type, titles you've already saved appear as suggestions.</td></tr>
+  <tr><td><b>Difficulty</b></td><td>Easy, Medium or Hard, as shown on Deep-ML.</td></tr>
+  <tr><td><b>Problem URL</b></td><td>Optional. The problem's link on Deep-ML. It must start with <code>https://www.deep-ml.com/</code>.</td></tr>
+  <tr><td><b>Solved</b></td><td>On by default. Switch it off if you haven't solved it yet.</td></tr>
+  <tr><td><b>Manual entry</b></td><td>Switch on to log the problem without any code. See <a href="#status">section 7</a>.</td></tr>
+  <tr><td><b>Solution</b></td><td>Paste your code from Deep-ML (up to 200,000 characters). Required unless Manual entry is on.</td></tr>
+  <tr><td><b>Commit message</b></td><td>Optional short note (up to 100 characters), for example <i>Vectorised with numpy</i>.</td></tr>
+</table>
+<p>A green notification confirms the save and includes a <b>View commit on GitHub</b> link. In your repository, your code is saved in the <code>solutions</code> folder, for example <code>solutions/single_neuron.py</code>, and the repository's README gets a list of your problems.</p>
+
+<h2 id="update">6. Update a solution later</h2>
+<p>Improved your answer? Type the same problem title again (or pick it from the suggestions). A blue notice appears: <i>A solution for this problem already exists.</i></p>
+<ol>
+  <li>Click <b>Load current code</b> to bring your saved version into the editor.</li>
+  <li>Make your changes.</li>
+  <li>Click <b>Commit changes</b>.</li>
+</ol>
+<p>The app updates the same file instead of creating a copy, and GitHub keeps the earlier versions in the file's history. Capital letters, spaces and punctuation in the title don't matter: <i>single neuron</i> and <i>Single-Neuron</i> mean the same problem. If you commit identical code, you'll see a <b>No changes</b> notice and nothing is saved.</p>
+
+<h2 id="status">7. Solved switch and manual entries</h2>
+<h3>Solved or not solved</h3>
+<p>Use the <b>Solved</b> switch when you commit. You can also flip it later from the <b>Your problems</b> list (see below). Unsolved problems are counted separately in your Stats.</p>
+<h3>Manual entries</h3>
+<p>A manual entry records a problem without any code, for example one you're still working on or solved elsewhere.</p>
+<ol>
+  <li>Switch on <b>Manual entry</b>. The code box becomes optional and the button reads <b>Add manual entry</b>.</li>
+  <li>Enter the title, difficulty, and optionally the URL. Switch <b>Solved</b> off if it isn't solved yet.</li>
+  <li>Click <b>Add manual entry</b>.</li>
+</ol>
+<p>The problem appears in your list with a <i>manual</i> tag. When you're ready, commit the same title again with your code to complete it. If the problem already has saved code, a manual update only changes the status, difficulty and link. It never erases your code.</p>
+
+<h2 id="problems">8. Your problems</h2>
+<p>This list shows every problem you've saved, newest first.</p>
+<ul>
+  <li>A <b>green tick</b> means solved. An <b>empty circle</b> means not solved yet.</li>
+  <li>Small tags show the difficulty and whether it's a manual entry.</li>
+  <li><b>Click a title</b> to load that problem into the form, ready to edit.</li>
+  <li>The <b>arrow icon</b> opens the file on GitHub.</li>
+  <li>The <b>switch</b> on the right marks the problem solved or unsolved straight away.</li>
+  <li>Use <b>All / Solved / Unsolved</b> to filter, and <b>Refresh</b> to reload the list (handy if you changed files directly on GitHub).</li>
+</ul>
+
+<h2 id="stats">9. Stats</h2>
+<p>The <b>Stats</b> section summarises your progress.</p>
+<table>
+  <tr><th>Item</th><th>Meaning</th></tr>
+  <tr><td><b>Solved</b></td><td>Problems marked solved, out of all your saved problems.</td></tr>
+  <tr><td><b>Completion</b></td><td>The percentage of your problems that are solved.</td></tr>
+  <tr><td><b>Unsolved / Manual entries</b></td><td>Problems not solved yet, and entries saved without code.</td></tr>
+  <tr><td><b>Current streak</b></td><td>Days in a row with at least one commit. If you haven't committed yet today, your streak stays alive until midnight.</td></tr>
+  <tr><td><b>Longest streak</b></td><td>Your best run of consecutive days in the last year.</td></tr>
+  <tr><td><b>By difficulty</b></td><td>Bars showing how many Easy, Medium and Hard problems you've solved.</td></tr>
+  <tr><td><b>Activity</b></td><td>A calendar of the last 12 months. Each square is a day and darker means more commits. Hover over a square to see the date and count.</td></tr>
+</table>
+<p>Activity counts commits to your solutions (including updates and solved/unsolved changes). Days follow your device's time zone.</p>
+
+<h2 id="schedule">10. Schedule a commit (owner access)</h2>
+<p>Scheduling is available to the person who runs the app, using <b>Owner access</b> with the app key. If you connected with your own token, you won't see these options.</p>
+<ol>
+  <li>Fill in your solution as usual.</li>
+  <li>Switch on <b>Schedule for later</b>.</li>
+  <li>Choose a date and time under <b>Publish at</b>, or tap a shortcut: <b>Next Saturday 10:00</b>, <b>Next Sunday 10:00</b> or <b>Tomorrow 09:00</b>.</li>
+  <li>Click <b>Schedule commit</b>.</li>
+</ol>
+<p>Your solution now waits in the <b>Scheduled</b> list. It is saved to GitHub automatically around the time you chose, usually within 15 to 30 minutes after it. Nothing appears on your GitHub activity until then.</p>
+<ul>
+  <li><b>Publish now</b> saves it immediately.</li>
+  <li><b>Cancel</b> removes it without saving.</li>
+  <li>You can schedule up to 60 days ahead and keep up to 30 items waiting.</li>
+</ul>
+
+<h2 id="messages">11. Notifications and what they mean</h2>
+<p>Short messages appear in the top-right corner and disappear after a few seconds. Click the <b>x</b> to close one sooner.</p>
+<table>
+  <tr><th>Colour</th><th>Meaning</th><th>Examples</th></tr>
+  <tr><td><span class="pill g">Green</span></td><td>It worked.</td><td>Connected, Solution committed, Solution updated, Manual entry added, Marked as solved, Scheduled, Published</td></tr>
+  <tr><td><span class="pill b">Blue</span></td><td>Information.</td><td>No changes, Loaded, Refreshed, Disconnected, Cancelled</td></tr>
+  <tr><td><span class="pill y">Amber</span></td><td>Something needs your attention.</td><td>Connect GitHub first, Title needed, Nothing to commit, Slow down, Heads up</td></tr>
+  <tr><td><span class="pill r">Red</span></td><td>It didn't work. The message says why.</td><td>Couldn't connect, Network error, Token expired or revoked, GitHub problem</td></tr>
+</table>
+
+<h2 id="keys">12. Keyboard shortcuts</h2>
+<ul>
+  <li><kbd>Ctrl</kbd> + <kbd>Enter</kbd> (or <kbd>Cmd</kbd> + <kbd>Enter</kbd> on a Mac): commit, or schedule if scheduling is on.</li>
+  <li><kbd>Enter</kbd> in the token or repository box: connect.</li>
+</ul>
+
+<h2 id="profile">13. Make commits show on your profile</h2>
+<p>Your commits appear as green squares on your GitHub profile when all of these are true:</p>
+<ul>
+  <li>The email address on your GitHub account is <b>verified</b> (GitHub: Settings, then Emails).</li>
+  <li>The repository is <b>your own</b> and not a fork.</li>
+  <li>If the repository is <b>private</b>, turn on <b>Private contributions</b> in your profile's contribution settings.</li>
+</ul>
+<p>New squares can take a few minutes to appear.</p>
+
+<h2 id="trouble">14. Troubleshooting</h2>
+<table>
+  <tr><th>You see</th><th>What to do</th></tr>
+  <tr><td>"That doesn't look like a GitHub token"</td><td>Copy the whole token again. It starts with <code>github_pat_</code> (or <code>ghp_</code>) and has no spaces.</td></tr>
+  <tr><td>"GitHub rejected this token"</td><td>The token is wrong, expired or deleted. Create a new one (<a href="#token">section 3</a>).</td></tr>
+  <tr><td>"Repository not found, or this token can't see it"</td><td>Check the spelling of <code>username/repository</code>. When creating the token, you must have picked this exact repository under <b>Repository access</b>.</td></tr>
+  <tr><td>"This token can only read the repository"</td><td>Edit the token on GitHub and set <b>Contents</b> to <b>Read and write</b>.</td></tr>
+  <tr><td>"This repository is archived"</td><td>Archived repositories are read-only. Un-archive it on GitHub or use another repository.</td></tr>
+  <tr><td>"Token expired or revoked"</td><td>Click <b>Disconnect</b>, create a new token, and connect again.</td></tr>
+  <tr><td>"GitHub denied access or hit a rate limit"</td><td>Wait a few minutes and try again. If it keeps happening, check the token's permissions.</td></tr>
+  <tr><td>"Too many requests"</td><td>Wait a minute, then try again.</td></tr>
+  <tr><td>"Network error"</td><td>Check your internet connection and try again. If the app has been idle, the first load can take about 30 seconds.</td></tr>
+  <tr><td>"Title has unsupported characters"</td><td>Use only the allowed characters listed in <a href="#commit">section 5</a>.</td></tr>
+  <tr><td>"Solution code is required"</td><td>Paste your code, or switch on <b>Manual entry</b>.</td></tr>
+  <tr><td>Problems list is empty after connecting</td><td>That's normal for a new repository. Commit your first solution, or click <b>Refresh</b>.</td></tr>
+  <tr><td>Asked to connect again after refreshing</td><td>By design. Tick <b>Keep me connected until I close this tab</b> to stay connected through refreshes.</td></tr>
+  <tr><td>Commits missing from my GitHub profile</td><td>See <a href="#profile">section 13</a>.</td></tr>
+</table>
+
+<h2 id="safe">15. Staying safe</h2>
+<ul>
+  <li>Treat your token like a password. Never share it, post it, or send it to anyone.</li>
+  <li>Use a fine-grained token limited to a single repository, and give it an expiry date.</li>
+  <li>The app only uses your token to save your solutions to your repository. It stays in your browser while you're connected and is removed when you disconnect or close the tab.</li>
+  <li>Only connect on a copy of the app run by someone you trust.</li>
+  <li>Click <b>Disconnect</b> when you finish on a shared or public computer.</li>
+</ul>
+<div class="callout warn">
+  <p><b>If your token might have leaked,</b> delete it right away: GitHub, then Settings, then Developer settings, then Personal access tokens, find the token, and choose <b>Delete</b>. Then create a new one.</p>
+</div>
+
+<h2 id="faq">16. Questions and answers</h2>
+<h3>Can I use a private repository?</h3>
+<p>Yes. Only you can see it. To show its activity on your profile, turn on Private contributions (<a href="#profile">section 13</a>).</p>
+<h3>Can I use more than one repository?</h3>
+<p>Yes, one at a time. Click <b>Disconnect</b>, then connect with the other repository's name.</p>
+<h3>Can I edit or delete a solution on GitHub directly?</h3>
+<p>Yes. Open the file in your repository. Click <b>Refresh</b> in the app afterwards to see changes. To remove a problem entirely, delete its file on GitHub.</p>
+<h3>Does my token need to be renewed?</h3>
+<p>Only when it expires. You'll see "Token expired or revoked". Create a new token and connect again.</p>
+<h3>My repository belongs to an organisation. Will it work?</h3>
+<p>It can, but some organisations require an owner to approve tokens first. If you see "Repository not found", ask an organisation owner.</p>
+<h3>Who can see my code?</h3>
+<p>In a public repository, anyone. In a private repository, only you and people you invite.</p>
+</main>
+
+<footer>
+  <div class="f-bottom">&copy; {{ year }} Karan Jajoria. Independent project, not affiliated with Deep-ML or GitHub. <a href="/">Back to the app</a></div>
+</footer>
 </body>
 </html>
 """
